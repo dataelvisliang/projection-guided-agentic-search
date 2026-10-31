@@ -1,158 +1,115 @@
 import assert from 'node:assert/strict';
 import { tool } from '@openai/agents';
 import { SearchSession } from '../src/agent/searchSession';
-import { taskSchema, actionSchemas, jsonSchemaFor } from '../src/agent/searchContract';
+import { actionSchemas, jsonSchemaFor } from '../src/agent/searchContract';
 import type { ActionName } from '../src/agent/searchContract';
 import type { ToolCall, ToolResult } from '../src/tools/toolExecutor';
 
 const bounds = { min_x: 0, max_x: 20, min_y: 0, max_y: 20 };
+const ring = { min_x: 1, max_x: 2, min_y: 3, max_y: 4 };
 for (const name of Object.keys(actionSchemas) as ActionName[]) {
     assert.doesNotThrow(() => tool({ name, description: name, parameters: jsonSchemaFor(name), strict: false, execute: async () => 'fixture' }));
 }
-const baseTask = { mode: 'exploration', target_count: 3, finding_unit: 'one coherent wine theme', require_diversity: true, hard_filters: { max_price: 25 }, filter_sources: [{ field: 'max_price', quote: 'under $25' }], evidence_requirements: ['savory red'] } as const;
-const task = () => taskSchema.parse(baseTask);
-const circles = [0, 1, 2].map(i => ({ id: `c${i}`, center_x: 3 + i * 6, center_y: 5, radius: 2, density: 100 }));
+
 class Fixture {
     calls: ToolCall[] = [];
-    purity = .9;
-    intent = .9;
-    failure = false;
-    duplicate = false;
-    price = 20;
-    constraint: boolean | null = true;
+    rings = false;
+    intent = 0.9;
     async execute(call: ToolCall): Promise<ToolResult> {
         this.calls.push(call);
-        const a = JSON.parse(call.function.arguments);
-        const name = call.function.name;
-        if (name === 'scan_projection') return { name, call_id: call.id, result: { regions: circles } };
-        if (name === 'subdivide_region') return { name, call_id: call.id, result: { children: [
-            { id: 'child', center_x: a.center_x, center_y: a.center_y, radius: .5, density: 10 },
-            { id: 'escaped', center_x: 99, center_y: 99, radius: 1, density: 10 }
-        ] } };
-        if (name === 'compare_regions') return { name, call_id: call.id, result: { regions: a.regions } };
-        return { name, call_id: call.id, result: { regions: a.regions.map((r: { id: string }, index: number) => ({
-            ...r, category: this.duplicate ? 'same' : `theme${r.id}`, themes: [this.duplicate ? 'same' : `flavor${r.id}`],
-            quotes: ['sample'], purity: this.purity, intent_match: this.intent, hard_constraint_match: this.constraint,
-            purity_rationale: 'coherent sample', intent_match_rationale: 'sample matches the query',
-            analysis_failed: this.failure, reviews: [0, 1, 2].map(n => ({ id: index * 10 + n, price: this.price })), density: 100
-        })) } };
+        const args = JSON.parse(call.function.arguments);
+        if (call.function.name === 'sql_query') {
+            return { name: 'sql_query', call_id: call.id, result: { rows: [], candidate_rings: this.rings ? [{ ...ring, support: 12 }] : [] } };
+        }
+        return { name: call.function.name, call_id: call.id, result: {
+            category: 'Pepper Syrah', themes: ['pepper'], summary: 'Pepper shows up in the sample.',
+            intent_fit: this.intent, evidence_ids: [7], region: args.region || null, seed_islands: [], candidate_rings: []
+        } };
     }
 }
-async function setup(overrides = {}) {
-    const s = new SearchSession('Find three savory red themes under $25', bounds);
-    const f = new Fixture();
-    await s.act('define_task', { ...task(), ...overrides }, f);
-    await s.act('scan_projection', { grid_size: 6, reason: 'cover the map' }, f);
-    return { s, f };
-}
-const inspect = (s: SearchSession, f: Fixture, region_ids = ['c0', 'c1', 'c2']) => s.act('inspect_regions', { region_ids, reason: 'inspect distinct areas' }, f);
-const finish = (s: SearchSession, f: Fixture) => s.act('finish_search', { reason: 'sufficient_evidence', finding_ids: ['c0', 'c1', 'c2'], explanation: 'Three sampled themes match.', distinctions: ['flavor c0', 'flavor c1', 'flavor c2'] }, f);
+const playbook = (s: SearchSession, f: Fixture, playbook_id = 'topic_exploration') => s.act('load_workflow_playbook', { playbook_id }, f);
+const sql = (s: SearchSession, f: Fixture, statement = 'SELECT 1 AS n FROM reviews') => s.act('sql_query', { sql: statement, purpose: 'count reviews' }, f);
 
-// A successful one-batch search is valid; refinement is optional.
 {
-    const { s, f } = await setup(); await inspect(s, f);
-    const evidenceCalls = f.calls.length;
-    await s.act('scan_projection', { grid_size: 4, reason: 'collect unnecessary evidence' }, f);
-    assert.equal(f.calls.length, evidenceCalls, 'retrieval is blocked once the accepted target is met');
-    assert.equal(s.modelState().next_required, 'finish_search');
-    await finish(s, f);
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    await s.act('sql_query', { sql: 'SELECT 1 AS n FROM reviews', purpose: 'count' }, f);
+    assert.equal(f.calls.length, 0);
+    assert.match(String((await s.act('map_search', { query: 'syrah', reason: 'seed' }, f) as { error?: string }).error), /load_workflow_playbook/);
+}
+{
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    await playbook(s, f); await sql(s, f); await sql(s, f, 'SELECT 2 AS n FROM reviews');
+    const blocked = await sql(s, f, 'SELECT 3 AS n FROM reviews') as { error?: string };
+    assert.match(blocked.error || '', /two SQL/);
+    assert.equal(f.calls.length, 2);
+}
+{
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    f.rings = true; await playbook(s, f); await sql(s, f);
+    const blocked = await sql(s, f, 'SELECT 2 AS n FROM reviews') as { error?: string };
+    assert.match(blocked.error || '', /region-constrained flexible_search/);
+    await s.act('flexible_search', { prompt: 'peppery syrah', query: 'pepper syrah', region: ring, reason: 'judge the ring' }, f);
+    assert.equal(s.modelState().judgments[0].intent_fit_label, 'high');
+    await s.act('complete_answer', { ready_to_answer: true, suggested_followups: [], categories: ['Pepper Syrah'], bounded: false, explanation: 'Peppered Syrah forms a coherent ring.' }, f);
     assert.equal(s.terminal?.state, 'success');
-    assert.equal(s.snapshot().stop_reason, s.terminal?.reason);
-    const count = f.calls.length;
-    await s.act('scan_projection', { grid_size: 4, reason: 'after stop' }, f);
-    assert.equal(f.calls.length, count, 'terminal state is absorbing');
-    assert.equal(s.presentation()?.result.record_ids.length, 9);
-}
-// Provenance, immutable scope and batch constraints cannot be weakened by the model.
-{
-    const { s, f } = await setup();
-    await inspect(s, f, ['invented']); await inspect(s, f, ['c0']);
-    assert.equal(f.calls.length, 1);
-    await s.act('define_task', { ...task(), hard_filters: {} }, f);
-    assert.equal(s.task?.hard_filters.max_price, 25);
-    await inspect(s, f);
-    assert.equal(JSON.parse(f.calls[1].function.arguments).search_context.hard_filters.max_price, 25);
-    await inspect(s, f);
-    assert.equal(f.calls.length, 2, 'successful samples cannot be repeated');
-}
-// Relevant mixed evidence permits refinement; irrelevant or accepted evidence does not.
-{
-    const { s, f } = await setup(); f.purity = .5; await inspect(s, f);
-    await finish(s, f); assert.equal(s.terminal, null);
-    await s.act('subdivide_region', { parent_id: 'c0', reason: 'high intent but mixed' }, f);
-    assert.equal(s.candidates.get('child')?.depth, 1);
-    assert.equal(s.candidates.has('escaped'), false, 'children must be contained in parent');
-    await s.act('subdivide_region', { parent_id: 'c0', reason: 'repeat' }, f);
-    assert.equal(f.calls.length, 3);
-    f.purity = .9; await inspect(s, f, ['child']);
-    assert.equal(s.candidates.get('child')?.status, 'accepted');
-}
-// Failure is unknown evidence and never semantic no-progress. Retry is bounded.
-{
-    const { s, f } = await setup(); f.failure = true; await inspect(s, f);
-    assert.equal(s.snapshot().no_progress_rounds, 0);
-    assert.equal(s.candidates.get('c0')?.status, 'failed');
-    await inspect(s, f);
-    assert.equal(s.terminal?.state, 'runtime_error');
-}
-// Unknown hard-constraint judgment fails closed.
-{
-    const { s, f } = await setup(); f.constraint = null; await inspect(s, f);
-    assert.equal(s.snapshot().accepted_region_count, 0);
-    assert.equal(s.candidates.get('c0')?.status, 'failed');
-}
-// Duplicate themes must not satisfy a diversity count.
-{
-    const { s, f } = await setup(); f.duplicate = true; await inspect(s, f);
-    assert.equal(s.snapshot().accepted_region_count, 1);
-    await finish(s, f); assert.equal(s.terminal, null);
-}
-// Comparison mode cannot succeed before the chosen evidence has been compared.
-{
-    const { s, f } = await setup({ mode: 'comparison' }); await inspect(s, f);
-    await finish(s, f); assert.equal(s.terminal, null);
-    await s.act('compare_regions', { region_ids: ['c0', 'c1', 'c2'], reason: 'contrast selected evidence' }, f);
-    await finish(s, f); assert.equal(s.terminal?.state, 'success');
-}
-// Budget expiration preserves state and prevents new execution.
-{
-    let now = 0; const s = new SearchSession('query', bounds, {}, () => now); const f = new Fixture();
-    now = 120001; await s.act('define_task', task(), f);
-    assert.equal(s.terminal?.state, 'budget_exhausted'); assert.equal(f.calls.length, 0);
-}
-// A prospective inspection cannot consume the finalization reserve; useful partial evidence remains explainable.
-{
-    const { s, f } = await setup({ target_count: 4 }); await inspect(s, f);
-    for (const i of [3, 4, 5]) s.candidates.set(`c${i}`, { id: `c${i}`, center_x: 3 + i * 3, center_y: 11, radius: 1, depth: 0, population: 10, status: 'proposed', attempts: 0, refined: false, acceptance_tier: null });
-    s.recordTokens(70000);
+    assert.match(s.answer(), /\{\{Pepper Syrah\}\}/);
     const calls = f.calls.length;
-    await inspect(s, f, ['c3', 'c4', 'c5']);
-    assert.equal(f.calls.length, calls, 'the prospective batch is blocked before consuming finalization tokens');
-    assert.equal(s.modelState().next_required, 'finish_search');
-    await s.act('finish_search', { reason: 'budget_reserve', finding_ids: ['c0', 'c1', 'c2'], explanation: 'Further inspection would consume the finalization reserve.', distinctions: ['a', 'b', 'c'] }, f);
+    await sql(s, f, 'SELECT 9 AS n FROM reviews');
+    assert.equal(f.calls.length, calls, 'terminal state is absorbing');
+}
+{
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    await playbook(s, f); await sql(s, f);
+    const repeated = await sql(s, f) as { error?: string };
+    assert.match(repeated.error || '', /search shape/);
+}
+{
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    f.intent = 0.4; await playbook(s, f);
+    await s.act('flexible_search', { prompt: 'peppery syrah', query: 'pepper', reason: 'judge a focused reading' }, f);
+    const blocked = await s.act('complete_answer', { ready_to_answer: true, suggested_followups: [], categories: ['Pepper Syrah'], bounded: true, explanation: 'The sample is off intent.' }, f) as { error?: string };
+    assert.match(blocked.error || '', /low intent_fit/);
+}
+{
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    f.intent = 0.6; await playbook(s, f);
+    await s.act('flexible_search', { prompt: 'peppery syrah', query: 'pepper', reason: 'judge a focused reading' }, f);
+    const blocked = await s.act('complete_answer', { ready_to_answer: true, suggested_followups: [], categories: ['Pepper Syrah'], bounded: false, explanation: 'Medium evidence.' }, f) as { error?: string };
+    assert.match(blocked.error || '', /bounded/);
+    await s.act('complete_answer', { ready_to_answer: true, suggested_followups: [{ kind: 'investigate', text: 'Look at a neighboring ring.' }], categories: ['Pepper Syrah'], bounded: true, explanation: 'The ring is only a partial match.' }, f);
     assert.equal(s.terminal?.state, 'partial_success');
 }
-// Unsupported modes are explicit, never disguised as successful region retrieval.
 {
-    const { s } = await setup({ mode: 'exact' }); assert.equal(s.terminal?.state, 'unsupported');
-}
-assert.equal(taskSchema.safeParse({ ...task(), hard_filters: { min_price: 40, max_price: 20 } }).success, false);
-assert.equal(taskSchema.safeParse({ ...task(), target_count: 0 }).success, false);
-{
-    const s = new SearchSession('Find savory reds', bounds); const f = new Fixture();
-    await s.act('define_task', { ...task(), hard_filters: { max_points: 0 }, filter_sources: [] }, f);
-    assert.equal(s.task, null, 'invented numeric defaults cannot define a task');
+    const s = new SearchSession('which country separates pepper', bounds); const f = new Fixture();
+    await playbook(s, f, 'dimension_signal_scan');
+    for (let i = 0; i < 4; i++) await sql(s, f, `SELECT ${i} AS n FROM reviews`);
+    const stopped = await sql(s, f, 'SELECT 9 AS n FROM reviews') as { stop_condition_met?: boolean };
+    assert.equal(stopped.stop_condition_met, true);
+    assert.equal(f.calls.length, 4);
 }
 {
-    const s = new SearchSession('Find savory reds from California', bounds); const f = new Fixture();
-    await s.act('define_task', { ...task(), hard_filters: { countries: ['US'] }, filter_sources: [{ field: 'countries', quote: 'California' }] }, f);
-    assert.equal(s.task, null, 'the Agent cannot silently normalize a string hard filter');
-    s.seedOracleTask({ ...task(), hard_filters: { countries: ['US'] }, filter_sources: [{ field: 'countries', quote: 'California' }] });
-    assert.deepEqual(s.task?.hard_filters.countries, ['US'], 'a separately labelled oracle annotation can normalize values');
+    const s = new SearchSession('how many peppery wines', bounds); const f = new Fixture();
+    await playbook(s, f, 'semantic_count');
+    const blocked = await sql(s, f) as { error?: string };
+    assert.match(blocked.error || '', /forbids SQL/);
 }
 {
-    const { s, f } = await setup(); f.price = 40; await inspect(s, f);
-    assert.equal(s.snapshot().accepted_region_count, 0);
-    assert.equal(s.candidates.get('c0')?.error, 'sample_scope_mismatch');
+    const s = new SearchSession('peppery syrah', bounds); const f = new Fixture();
+    await playbook(s, f);
+    const blocked = await s.act('sql_query', { sql: 'DELETE FROM reviews', purpose: 'remove' }, f) as { error?: string };
+    assert.match(blocked.error || '', /SELECT or WITH|forbidden/i);
+    const binned = await s.act('sql_query', { sql: 'SELECT FLOOR(projection_x / 48) AS gx FROM reviews', purpose: 'bad bins' }, f) as { error?: string };
+    assert.match(binned.error || '', /injected projection bounds/);
 }
-console.log('search contract: all invariant scenarios passed');
+{
+    let now = 0; const s = new SearchSession('query', bounds, {}, () => now); const f = new Fixture();
+    now = 120001; await playbook(s, f);
+    assert.equal(s.terminal?.state, 'budget_exhausted');
+    assert.equal(f.calls.length, 0);
+}
+{
+    const s = new SearchSession('query', bounds);
+    s.seedOracleTask();
+    assert.equal(s.terminal?.state, 'unsupported');
+}
+console.log('search contract: topic ring probe invariants passed');

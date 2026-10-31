@@ -1,6 +1,6 @@
 import { Agent, OpenAIProvider, Runner, tool } from '@openai/agents';
 import { actionSchemas, AGENT_INSTRUCTIONS, descriptions, jsonSchemaFor, LIMITS } from '../src/agent/searchContract';
-import type { ActionName, SearchTask } from '../src/agent/searchContract';
+import type { ActionName } from '../src/agent/searchContract';
 import { SearchSession } from '../src/agent/searchSession';
 import { ToolExecutor } from '../src/tools/toolExecutor';
 import { getServerCoordinator } from './serverDuckDb';
@@ -10,7 +10,7 @@ export async function runProjectionAgent({ messages, origin, signal, taskSpec, o
     messages: Array<{ role: string; content: string }>;
     origin: string;
     signal?: AbortSignal;
-    taskSpec?: SearchTask;
+    taskSpec?: unknown;
     onTrace?: (event: unknown) => void;
 }) {
     const key = process.env.OPENROUTER_API_KEY;
@@ -40,6 +40,7 @@ export async function runProjectionAgent({ messages, origin, signal, taskSpec, o
         parameters: jsonSchemaFor(name), strict: false,
         async execute(input, context) {
             account(context?.usage);
+            session.observeModelRequest(context?.usage?.requests ?? 0);
             const result = await session.act(name, input, executor);
             onTrace?.({ snapshot: session.snapshot() });
             return JSON.stringify(result);
@@ -59,27 +60,24 @@ export async function runProjectionAgent({ messages, origin, signal, taskSpec, o
     const abort = () => session.end('budget_exhausted', 'request cancelled or elapsed-time budget reached');
     combined.addEventListener('abort', abort, { once: true });
     try {
-        if (taskSpec) {
-            session.seedOracleTask(taskSpec);
-            if (!session.task) session.end('runtime_error', 'Supplied oracle task specification failed contract validation');
-        }
+        if (taskSpec) session.seedOracleTask();
         if (!session.terminal) {
             const input = `${messages.slice(-6).map(m => `[${m.role}] ${m.content}`).join('\n\n')}\nInitial SESSION: ${JSON.stringify(session.modelState())}`;
-            const result = await runner.run(agent, input, { maxTurns: LIMITS.actions + 2, signal: combined });
+            const result = await runner.run(agent, input, { maxTurns: LIMITS.actions, signal: combined });
             account(result.runContext.usage);
         }
-        if (!session.terminal) session.end('runtime_error', 'Model ended without an accepted finish_search request');
+        if (!session.terminal) session.end('runtime_error', 'Model ended without an accepted complete_answer request');
     } catch (error) {
         const e = error as { state?: { _context?: { usage?: Parameters<typeof account>[0] } }; name?: string; message?: string };
         account(e.state?._context?.usage);
         session.end(combined.aborted ? 'budget_exhausted' : 'runtime_error', combined.aborted ? 'request cancelled or elapsed-time budget reached' : `${e.name || 'Error'}: ${e.message || 'runtime failed'}`);
     } finally { combined.removeEventListener('abort', abort); }
     const presentation = session.presentation();
-    usage.analyzer_tokens = session.results.reduce((sum, r) => sum + (r.result?.regions || []).reduce((n: number, c: { analyzer_usage?: { total_tokens?: number } }) => n + (Number(c.analyzer_usage?.total_tokens) || 0), 0), 0);
+    usage.analyzer_tokens = session.results.reduce((sum, r) => sum + (Number(r.result?.analyzer_usage?.total_tokens) || 0), 0);
     usage.total_tokens = usage.agent_tokens + usage.analyzer_tokens;
     onTrace?.({ snapshot: session.snapshot(), usage });
     return { content: session.answer(), terminal: session.terminal!, searchPolicy: session.snapshot(),
         toolResults: presentation ? [...session.results, presentation] : session.results,
-        toolSequence: session.events.filter(e => e.status === 'accepted' || e.status === 'completed' && ['define_task', 'finish_search'].includes(e.tool)).map(e => e.tool),
-        usage, taskSource: taskSpec ? 'oracle_task_spec' : 'agent_compiled' };
+        toolSequence: session.events.filter(e => e.status === 'completed').map(e => e.tool),
+        usage, taskSource: taskSpec ? 'unsupported_oracle_task_spec' : 'agent_compiled' };
 }

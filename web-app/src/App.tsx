@@ -244,10 +244,10 @@ function App() {
   // Tool icon mapping
   const getToolIcon = (toolName: string) => {
     switch (toolName) {
-      case 'filter_records': return <Search size={12} />;
-      case 'scan_projection':
-      case 'inspect_regions':
-      case 'subdivide_region': return <Database size={12} />;
+      case 'map_search':
+      case 'flexible_search': return <Search size={12} />;
+      case 'sql_query':
+      case 'load_workflow_playbook': return <Database size={12} />;
       case 'compare_regions': return <BarChart3 size={12} />;
       case 'save_selection': return <Download size={12} />;
       default: return <Database size={12} />;

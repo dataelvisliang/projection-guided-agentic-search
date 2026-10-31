@@ -1,72 +1,34 @@
-# PAR search contract v3
+# Topic Ring Probe
 
-Version: `par-agent-v3`. This replaces the old free-planner/SearchPolicy pair and the deterministic circle scheduler. The original strategy is preserved: the main Agent scans a map, chooses several circles, observes purity/intent evidence, and chooses further exploration, subdivision or termination.
+Version: `topic-ring-probe-v1`. This replaces the circle planner (`par-agent-v3`). The search unit is a ring: a rectangle `{min_x, max_x, min_y, max_y}` on the review map. Keywords only locate rings. `flexible_search` judges a ring and returns `intent_fit`. Answers cite accepted rings.
+
+The dataset stays `reviews`. It plays the Topic table: one point is one review, the id is `__row_index__`, and the default search text is `description`. There is no `turn`, conversation id, company, or trace table, so this build does not implement Use Case mode, same-conversation context, multiturn analysis, or trace lookup.
 
 ## Ownership
 
-- `searchContract.ts`: single executable source of input schemas, limits and planner instructions.
-- `SearchSession`: sole owner of task, candidate provenance, evidence eligibility, budgets and terminal state. It validates decisions; it does not choose circles.
-- OpenAI Agents SDK: owns model/tool turns. Main Agent selects actions and candidates. The SDK tool completion callback stops the run only when the session is terminal.
-- `ToolExecutor`: SQL over XY, metadata and text samples. No runtime vectors or embedding service.
-- Analyzer: labels every actual sample for dominant-theme membership and 0/1/2 intent relevance, including price/country/variety/points and original intent. The server deterministically aggregates those labels into purity and intent_match. One attempt per inspection; the session permits one failed-circle retry.
-- Presenter: one result selection after termination, derived from sampled record IDs. It is not an Agent tool.
+- `searchContract.ts`: Topic tool schemas, playbook text, limits, and the agent instructions.
+- `SearchSession`: validates the playbook gate, SQL budget, ring transitions, repeated search shapes, and `complete_answer`. It does not choose the next ring.
+- OpenAI Agents SDK: owns model and tool turns. A new model request resets the per-turn SQL count.
+- `ToolExecutor`: guarded SQL, lexical `map_search`, and `flexible_search` over server DuckDB. No vector index.
+- Analyzer: one ring sample in, the Topic JSON contract out (`category`, `themes`, `summary`, `intent_fit`).
 
-## Six Agent tools
+## Tools
 
-| Tool | Inputs | Contract |
-| --- | --- | --- |
-| define_task | mode, target_count, finding_unit, require_diversity, hard_filters, filter_sources, evidence_requirements | Once, before retrieval; immutable thereafter |
-| scan_projection | grid_size, reason | Proposes spatial circles; cannot interpret semantics; two distinct scales maximum |
-| inspect_regions | region_ids, reason | 3–8 proposals together, or all eligible when fewer than 3 remain; exact geometry and scope injected |
-| subdivide_region | parent_id, reason | Parent has relevant mixed evidence; contained smaller children; at most depth 2 and one subdivision per parent |
-| compare_regions | region_ids, reason | Accepted inspected evidence only; must precede comparison success |
-| finish_search | reason, finding_ids, explanation, distinctions | Session verifies the target or grounds for partial completion; then all further actions are forbidden |
+- `load_workflow_playbook` must be the first tool. The directory is `topic_exploration`, `region_tile_discovery`, `facet_use_case_discovery`, `semantic_count`, `exact_analytics`, `dimension_signal_scan`, and `row_examples`.
+- `sql_query` is one `SELECT` or `WITH` over `reviews`, capped at 1000 rows. Density grids use `FLOOR((projection_x - min_x) / range_x * N)`.
+- `map_search` normalizes text the same way in JavaScript and SQL, then runs a ranked query or recall (phrase, all tokens, any token, morphology, reciprocal rank fusion) and groups direct hits into seed islands.
+- `flexible_search` is recall `map_search` plus the Analyzer. Neighbors inside radius 0.045 reach the Analyzer only when they match a phrase or at least two terms, and 25% of the 50 slots (at most 13) are reserved for them.
+- `report_progress` and `complete_answer` close the turn. `{{Category}}` names must come from `flexible_search`.
 
-Generic tool names do not imply arbitrary-dataset adapters: the current SQL metadata adapter still supports wine country, variety, price and points. Color and semantic constraints must remain in `evidence_requirements` and are judged from sample evidence. Do not invent literal keyword filters for flavors. Original query always reaches Analyzer, even with an oracle TaskSpec.
+## Controls enforced in the session
 
-Every Agent-compiled SQL filter requires a verbatim source quote. Numeric values and every country/variety value must occur in that quote; semantic normalization belongs in a trusted adapter, not model improvisation. Unspecified constraints are omitted, never represented by zero. This checks provenance, not the full semantic correctness of task compilation; the generated task remains part of evaluation. A benchmark oracle task enters only through the in-process pilot runner's separately labelled seed method and then obeys the same retrieval, evidence and terminal invariants. The public API does not accept oracle TaskSpecs.
+- No search tool runs before a playbook is loaded.
+- Before the first `flexible_search`, at most two SQL queries run in one assistant turn. `exact_analytics` and `row_examples` are the narrower exceptions.
+- Once a SQL or seed search has returned a ring, the next data tool must be region-constrained `flexible_search`.
+- `semantic_count` and `facet_use_case_discovery` cannot start with SQL.
+- `dimension_signal_scan` stops after 4 SQL calls and 2 `flexible_search` calls.
+- A repeated search shape is rejected. After the first judged result, 3 refinements or 2 non-improving searches end retrieval.
+- `intent_fit` is high at or above 0.8, medium from 0.55, and low below that. A low ring cannot be cited. A medium ring requires `bounded: true`.
+- The loop cap is 35 actions. At action 34 the session only accepts `complete_answer` or `report_progress`.
 
-An unbounded “good value” request is evaluated comparatively from sampled price, points and review quality. Literal mentions of “bargain” or “good value” are optional corroboration, not required evidence, and the Agent must not invent a numeric price cutoff.
-
-`finding_unit` defines ONE style/theme/region. `target_count` and between-region diversity belong to the whole session. Analyzer must not lower a pure single-style circle's relevance because the user wants multiple styles overall, or reward a mixed circle for containing the entire requested count.
-
-`exact` record requests return `unsupported`; this region workflow must not silently substitute region counts for record counts. Semantic, exploration and comparison return regions. Map-selection scoping requires an explicit separate scope adapter and must not silently search the whole map.
-
-## Evidence states and decisions
-
-Proposed -> accepted / frontier / rejected / failed. Failed is unknown, never a semantic rejection, never negative progress. Valid evidence needs at least 3 distinct sampled IDs, numeric scores in [0,1], a category and an explicit constraint judgment. Analyzer returns two typed arrays in input order: dominant-theme membership and 0/1/2 relevance. Wrong-length arrays fail analysis; trusted review IDs never enter model output. Purity is dominant-theme members divided by sample count. Intent match is summed per-item relevance divided by twice the sample count.
-
-- Strong: purity >= .70 and intent >= .75.
-- Soft: purity >= .75 and intent >= .65.
-- Diversity: exploration only, purity >= .70 and intent >= .60, with no detected duplicate.
-- All accepts require constraint_match=true.
-- Refinement: frontier with intent >= .60 and purity < .70, constraint_match=true, sufficient depth/action/circle budget.
-- Semantic duplication uses matching labels, token-set similarity or sampled-ID overlap. This is a conservative heuristic, not proof of semantic distinctness; the Agent supplies distinctions and human benchmark judgments assess them.
-
-Sampling is fixed by hash(row ID), with row ID as a tie-breaker. Pin dataset and DuckDB version for replay. LLM output remains nondeterministic. A fixed sample does not constitute a confidence interval or validation of every row in the circle.
-
-## Termination
-
-One `terminal` object feeds API, UI and pilot. Terminal is absorbing.
-
-- success: selected accepted findings reach target; diversity explanations present when required; comparison completed when required.
-- partial_success / no_evidence: fewer findings and either generated actions exhausted or two complete valid low-progress batches. An actionable refinement prevents early partial stop.
-- budget_exhausted: action, token, circle or wall-time budget/cancellation.
-- runtime_error: infrastructure failures, unrecoverable analysis or illegal premature model final.
-- unsupported: exact record workflow is outside this endpoint.
-
-Unknown/failed analysis cannot justify `no_evidence`. Exhaustion refers to generated proposals and permitted scan scales, never proof that the dataset contains no answer. Reaching a budget with useful findings preserves those findings and the budget terminal.
-
-Once the accepted target is met, the session exposes `target_met=true` and blocks further scan, inspection and subdivision. Only a required comparison and `finish_search` remain legal. This prevents an Agent from spending the remaining budget after it already has sufficient evidence.
-
-Token limits are checked against returned usage. A running model request/batch may overshoot the limit before its usage is known; it prevents subsequent actions, not charges already incurred. Failure responses can have unreported usage. Live output must not imply these are exact billing totals.
-
-Before an inspection batch, the session reserves a bounded finalization allowance using a conservative per-circle estimate. If the batch would consume that allowance, it is blocked and the model must call `finish_search` with `budget_reserve`; accepted findings then return as a clearly labelled partial result rather than an unexplainable budget exhaustion.
-
-## Evaluation contract
-
-Offline tests assert invalid-ID rejection, batch size, immutable scope, refinement containment/provenance, failure/retry separation, diversity count, comparison-before-success and absorbing terminal states. Tests allow different Agent strategies and successful one-batch completion.
-
-Live pilot uses the same query-to-define_task path as chat by default. `--oracle-task-spec` is a separately labeled experimental condition, not the product gate. Do not compare these conditions as if their input information were identical.
-
-Record contract validity separately from task success and relevance quality. Preserve incremental `.trace.jsonl` snapshots, generated task, accepted/rejected/frontier/failed, terminal, final answer, token counts and latency. Monetary cost stays null unless provider-reported pricing is available. Live pilot establishes integration behavior; it does not establish PAR superiority or annotation quality.
+The model remains the OpenRouter model in `OPENROUTER_MODEL` (default `z-ai/glm-5.3-flash`). Wall-clock and token caps are runtime guards around that loop.

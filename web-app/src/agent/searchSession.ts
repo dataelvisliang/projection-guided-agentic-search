@@ -1,335 +1,320 @@
-import { actionSchemas, CONTRACT_VERSION, LIMITS, taskSchema } from './searchContract';
-import type { ActionName, Candidate, Circle, Evidence, SearchTask, Terminal } from './searchContract';
+import { actionSchemas, CONTRACT_VERSION, LIMITS, PLAYBOOKS } from './searchContract';
+import type { ActionName, PlaybookId } from './searchContract';
 import type { ToolCall, ToolResult } from '../tools/toolExecutor';
+import { classifyIntentFit, validateTopicSql } from '../tools/mapSearch';
+import type { Bounds, Region } from '../tools/mapSearch';
 
 type Executor = { execute(call: ToolCall): Promise<ToolResult> };
 type Event = { sequence: number; tool: string; status: 'accepted' | 'completed' | 'blocked' | 'failed'; parameters?: unknown; detail?: string };
-export type Bounds = { min_x: number; max_x: number; min_y: number; max_y: number };
-const distance = (a: Circle, b: Circle) => Math.hypot(a.center_x - b.center_x, a.center_y - b.center_y);
-const sameCircle = (a: Circle, b: Circle) => distance(a, b) <= Math.min(a.radius, b.radius) * .25 && Math.max(a.radius, b.radius) <= Math.min(a.radius, b.radius) * 1.25;
-const score = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
-const strings = (v: unknown): string[] => Array.isArray(v) ? v.filter((s): s is string => typeof s === 'string') : [];
-const words = (v: string[]) => new Set(v.join(' ').toLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
+export type Terminal = { state: 'success' | 'partial_success' | 'no_evidence' | 'budget_exhausted' | 'runtime_error' | 'unsupported'; reason: string };
+export interface Judgment {
+    id: string;
+    region: Region | null;
+    category: string;
+    themes: string[];
+    summary: string;
+    intent_fit: number;
+    intent_fit_label: 'high' | 'medium' | 'low';
+    evidence_ids: number[];
+    fallback: boolean;
+    requires_expansion: boolean;
+}
+interface Probe { id: string; region: Region; support: number; source: string; judged: boolean }
 
-/** One owner for task, candidate provenance, evidence, budgets and terminal state.
- * This class validates agent decisions; it never schedules the next circle. */
+const SEARCH_TOOLS = new Set<ActionName>(['sql_query', 'map_search', 'flexible_search']);
+const NARROW_PLAYBOOKS = new Set<PlaybookId>(['exact_analytics', 'row_examples']);
+
+/** Validates Topic Ring Probe decisions. It does not choose the next ring. */
 export class SearchSession {
-    task: SearchTask | null = null;
     terminal: Terminal | null = null;
     readonly results: ToolResult[] = [];
     readonly events: Event[] = [];
-    readonly candidates = new Map<string, Candidate>();
-    readonly comparisonResults: ToolResult[] = [];
-    readonly selectedIds: string[] = [];
+    readonly judgments: Judgment[] = [];
+    readonly probes: Probe[] = [];
     onChange?: () => void;
     readonly limits: typeof LIMITS;
-    private scans = new Set<number>();
-    private refinements = 0;
-    private inspected = 0;
-    private actions = 0;
-    private failures = 0;
-    private lowProgress = 0;
-    private tokens = 0;
-    private finalizationReserved = false;
-    private started: number;
-    private busy = false;
-    private distinctions: string[] = [];
-    private explanation = '';
     readonly query: string;
     readonly bounds: Bounds;
+    playbook: PlaybookId | null = null;
+    private actions = 0;
+    private tokens = 0;
+    private sqlThisTurn = 0;
+    private refinements = 0;
+    private nonImproving = 0;
+    private judgedSearches = 0;
+    private bestIntent = -1;
+    private dimensionSql = 0;
+    private dimensionFlexible = 0;
+    private awaitingJudge = false;
+    private mustStopSearching = false;
+    private requiresExpansion = false;
+    private shapes = new Set<string>();
+    private requestGeneration = -1;
+    private cited: string[] = [];
+    private explanation = '';
+    private bounded = false;
+    private started: number;
+    private busy = false;
     private now: () => number;
+    private sequence = 0;
 
     constructor(query: string, bounds: Bounds, limits: Partial<typeof LIMITS> = {}, now = Date.now) {
-        this.query = query; this.bounds = bounds; this.now = now;
+        this.query = query;
+        this.bounds = bounds;
+        this.now = now;
         this.started = now();
         this.limits = { ...LIMITS, ...limits };
     }
 
     recordTokens(tokens: number): void { if (Number.isFinite(tokens) && tokens > 0) this.tokens += tokens; }
+
+    /** A new model request closes the previous assistant turn, including its SQL count. */
+    observeModelRequest(requests: number): void {
+        if (requests === this.requestGeneration) return;
+        this.requestGeneration = requests;
+        this.sqlThisTurn = 0;
+    }
+
     end(state: Terminal['state'], reason: string): void {
         if (this.terminal) return;
         this.terminal = { state, reason };
-        if (!this.selectedIds.length) this.selectedIds.push(...this.accepted().slice(0, this.task?.target_count || 8).map(c => c.id));
         this.onChange?.();
     }
+
+    seedOracleTask(): unknown {
+        this.end('unsupported', 'Oracle task specs are outside Topic Ring Probe. The agent compiles the search from the question.');
+        return { terminal: this.terminal };
+    }
+
     checkBudget(): boolean {
         if (!this.terminal && (this.actions >= this.limits.actions || this.tokens >= this.limits.tokens || this.now() - this.started >= this.limits.elapsedMs))
             this.end('budget_exhausted', 'search action, token or elapsed-time budget reached');
         return Boolean(this.terminal);
     }
-    private accepted(): Candidate[] { return [...this.candidates.values()].filter(c => c.status === 'accepted'); }
-    private available(): Candidate[] {
-        return [...this.candidates.values()].filter(c => c.status === 'proposed' || c.status === 'failed' && c.attempts <= this.limits.retries);
+
+    async act(name: ActionName, input: unknown, executor: Executor): Promise<unknown> {
+        if (this.busy) return this.deny(name, 'Observe the current tool result before another action.');
+        if (this.terminal) return { terminal: this.terminal, session: this.modelState() };
+        if (this.checkBudget()) return { terminal: this.terminal, session: this.modelState() };
+        const parsed = actionSchemas[name].safeParse(input);
+        if (!parsed.success) return this.deny(name, parsed.error.message);
+        if (this.actions >= 33 && name !== 'complete_answer' && name !== 'report_progress')
+            return this.deny(name, 'Iteration 34 of 35. Stop searching and call complete_answer.');
+        this.actions++;
+        if (name !== 'load_workflow_playbook' && !this.playbook)
+            return this.deny(name, 'required_next_step: Call load_workflow_playbook first');
+        if (name === 'load_workflow_playbook') return this.loadPlaybook(actionSchemas.load_workflow_playbook.parse(input).playbook_id);
+        if (name === 'report_progress') {
+            this.event('report_progress', 'completed', parsed.data);
+            return { acknowledged: true, session: this.modelState() };
+        }
+        if (name === 'complete_answer') return this.complete(actionSchemas.complete_answer.parse(input));
+        return this.search(name, parsed.data as Record<string, unknown>, executor);
     }
-    private reserveFinalizationForInspection(count: number): boolean {
-        const projected = count * this.limits.estimatedInspectionTokensPerRegion + this.limits.finalizationReserveTokens;
-        if (this.tokens + projected <= this.limits.tokens) return false;
-        this.finalizationReserved = true;
-        return true;
+
+    private loadPlaybook(id: PlaybookId): unknown {
+        if (this.playbook) return this.deny('load_workflow_playbook', 'A playbook is already loaded for this turn.');
+        this.playbook = id;
+        this.event('load_workflow_playbook', 'completed', { playbook_id: id });
+        return { playbook_id: id, title: PLAYBOOKS[id].title, playbook: PLAYBOOKS[id].text, session: this.modelState() };
     }
-    private canRefine(c: Candidate): boolean {
-        return c.status === 'frontier' && !c.refined && c.depth < this.limits.depth && this.refinements < this.limits.refinements &&
-            this.limits.inspected - this.inspected >= 2 && Boolean(c.evidence && c.evidence.intent_match >= .60 && c.evidence.purity < .70 && c.evidence.hard_constraint_match === true);
+
+    private async search(name: ActionName, data: Record<string, unknown>, executor: Executor): Promise<unknown> {
+        if (!SEARCH_TOOLS.has(name)) return this.deny(name, 'Unsupported tool.');
+        if (this.mustStopSearching) return this.deny(name, 'Refinement budget is spent. Call complete_answer with a caveat.');
+        const playbook = this.playbook!;
+        const narrow = NARROW_PLAYBOOKS.has(playbook);
+        if (!narrow && this.awaitingJudge && name !== 'flexible_search')
+            return this.deny(name, 'A viable ring exists. The next data tool must be region-constrained flexible_search.');
+        if (name === 'sql_query' && !narrow && this.sqlThisTurn >= this.limits.sqlPerTurnBeforeJudge && !this.judgedSearches)
+            return this.deny(name, 'At most two SQL queries in one assistant turn before the first flexible_search.');
+        if ((playbook === 'semantic_count' || playbook === 'facet_use_case_discovery') && name === 'sql_query' && !this.judgedSearches && !this.results.some(result => result.name === 'map_search' || result.name === 'flexible_search'))
+            return this.deny(name, 'This playbook forbids SQL until map_search or flexible_search has defined the terms or anchors.');
+        if (playbook === 'dimension_signal_scan' && ((name === 'sql_query' && this.dimensionSql >= this.limits.dimensionSql) || (name === 'flexible_search' && this.dimensionFlexible >= this.limits.dimensionFlexible)))
+            return this.stopDimension();
+        const shape = searchShape(name, data);
+        if (this.shapes.has(shape)) return this.deny(name, 'Repeating a search shape is forbidden. Change the interpretation, region, or anchors.');
+        if (name === 'flexible_search') {
+            const region = data.region as Region | undefined;
+            if ((this.awaitingJudge || this.probes.length) && !region)
+                return this.deny(name, 'Judging a ring requires its exact region.');
+            if (!region && !String(data.query || '') && !(data.terms as string[] | undefined)?.length)
+                return this.deny(name, 'flexible_search needs terms or a region.');
+        }
+        if (name === 'map_search' && !String(data.query || '') && !(data.terms as string[] | undefined)?.length && !data.region)
+            return this.deny(name, 'map_search needs terms or a region.');
+        if (name === 'sql_query') {
+            const problem = validateTopicSql(String(data.sql));
+            if (problem) return this.deny(name, problem);
+        }
+        if (this.judgedSearches && (name === 'sql_query' || name === 'map_search')) {
+            if (this.refinements >= this.limits.refinements) return this.deny(name, 'Three refinement attempts have been used. Call complete_answer.');
+            this.refinements++;
+        }
+        this.shapes.add(shape);
+        if (name === 'sql_query') this.sqlThisTurn++;
+        if (playbook === 'dimension_signal_scan' && name === 'sql_query') this.dimensionSql++;
+        if (playbook === 'dimension_signal_scan' && name === 'flexible_search') this.dimensionFlexible++;
+        this.busy = true;
+        let executed: ToolResult;
+        try {
+            executed = await executor.execute({
+                id: `call-${this.sequence + 1}`, type: 'function',
+                function: { name, arguments: JSON.stringify({ ...data, bounds: this.bounds }) }
+            });
+        } finally { this.busy = false; }
+        this.results.push(executed);
+        if (executed.error) {
+            this.event(name, 'failed', data, executed.error);
+            return { error: executed.error, session: this.modelState() };
+        }
+        this.ingest(executed.result);
+        if (this.refinements >= this.limits.refinements || this.nonImproving >= this.limits.nonImproving) this.mustStopSearching = true;
+        this.event(name, 'completed', data);
+        return { result: executed.result, session: this.modelState() };
     }
-    private semanticDuplicate(a: Candidate, b: Candidate): boolean {
-        if (!a.evidence || !b.evidence) return false;
-        const x = words([a.evidence.category, ...a.evidence.themes]), y = words([b.evidence.category, ...b.evidence.themes]);
-        const common = [...x].filter(w => y.has(w)).length;
-        const labelEqual = a.evidence.category.trim().toLowerCase() === b.evidence.category.trim().toLowerCase();
-        const ids = new Set(b.evidence.review_ids);
-        const overlap = a.evidence.review_ids.filter(id => ids.has(id)).length / Math.max(1, Math.min(ids.size, a.evidence.review_ids.length));
-        return labelEqual || common / Math.max(1, new Set([...x, ...y]).size) >= .65 || overlap >= .5;
+
+    private stopDimension(): unknown {
+        this.mustStopSearching = true;
+        this.event('dimension_signal_scan', 'completed', { stop_condition_met: true });
+        return { stop_condition_met: true, session: this.modelState() };
     }
+
+    private ingest(result: { candidate_rings?: Array<Region & { support?: number }>; seed_islands?: Array<{ bbox: Region; support_count?: number }>; intent_fit?: number; category?: string; themes?: string[]; summary?: string; evidence_ids?: number[]; fallback?: boolean; coverage_warning?: { requires_expansion_for_broad_scope?: boolean } | null; region?: Region }): void {
+        const rings = [
+            ...(result.candidate_rings || []).map(ring => ({ region: ring, support: Number(ring.support || 0), source: 'sql' })),
+            ...(result.seed_islands || []).map(island => ({ region: island.bbox, support: Number(island.support_count || 0), source: 'seed_island' }))
+        ];
+        for (const ring of rings) {
+            if (this.probes.some(probe => sameRegion(probe.region, ring.region))) continue;
+            this.probes.push({ id: `ring-${this.probes.length + 1}`, region: ring.region, support: ring.support, source: ring.source, judged: false });
+        }
+        if (typeof result.intent_fit === 'number') {
+            const fit = result.intent_fit;
+            const label = classifyIntentFit(fit);
+            const judgment: Judgment = {
+                id: `judge-${this.judgments.length + 1}`,
+                region: result.region || null,
+                category: String(result.category || 'Unlabeled sample'),
+                themes: Array.isArray(result.themes) ? result.themes.map(String) : [],
+                summary: String(result.summary || ''),
+                intent_fit: fit,
+                intent_fit_label: label,
+                evidence_ids: Array.isArray(result.evidence_ids) ? result.evidence_ids.filter(id => Number.isInteger(id)) : [],
+                fallback: Boolean(result.fallback),
+                requires_expansion: Boolean(result.coverage_warning?.requires_expansion_for_broad_scope)
+            };
+            this.judgments.push(judgment);
+            if (judgment.region) {
+                const probe = [...this.probes].reverse().find(item => sameRegion(item.region, judgment.region!));
+                if (probe) probe.judged = true;
+            }
+            if (this.judgedSearches > 0 && fit <= this.bestIntent) this.nonImproving++;
+            this.bestIntent = Math.max(this.bestIntent, fit);
+            this.judgedSearches++;
+            if (judgment.requires_expansion) this.requiresExpansion = true;
+            if (this.nonImproving >= this.limits.nonImproving || this.refinements >= this.limits.refinements) this.mustStopSearching = true;
+        }
+        this.awaitingJudge = this.probes.some(probe => !probe.judged);
+    }
+
+    private complete(data: { categories: string[]; bounded: boolean; explanation: string; suggested_followups: Array<{ kind: string; text: string }> }): unknown {
+        const cited = data.categories.map(category => this.judgments.find(item => item.category === category));
+        if (cited.some(item => !item)) return this.deny('complete_answer', 'Cite only category names returned by flexible_search.');
+        const judgments = cited as Judgment[];
+        if (judgments.some(item => item.intent_fit < 0.55)) return this.deny('complete_answer', 'A low intent_fit ring cannot support an answer.');
+        if (judgments.some(item => item.intent_fit < 0.8) && !data.bounded) return this.deny('complete_answer', 'A medium intent_fit ring requires bounded language.');
+        if (this.probes.some(probe => !probe.judged) && !data.bounded)
+            return this.deny('complete_answer', 'Unjudged rings remain. Judge them or mark the answer bounded.');
+        if ((this.requiresExpansion || this.mustStopSearching) && !data.bounded && !judgments.some(item => item.intent_fit >= 0.8))
+            return this.deny('complete_answer', 'Coverage or the refinement budget requires a bounded answer.');
+        if (!judgments.length && !data.bounded) return this.deny('complete_answer', 'An empty answer must say it is bounded by missing evidence.');
+        this.cited = data.categories;
+        this.explanation = data.explanation;
+        this.bounded = data.bounded || judgments.every(item => item.intent_fit < 0.8);
+        this.event('complete_answer', 'completed', data);
+        const high = judgments.some(item => item.intent_fit >= 0.8);
+        this.end(high ? 'success' : judgments.length ? 'partial_success' : 'no_evidence', high ? 'accepted_rings' : data.bounded ? 'bounded_evidence' : 'no_accepted_ring');
+        return { terminal: this.terminal, session: this.modelState() };
+    }
+
     private event(tool: string, status: Event['status'], parameters?: unknown, detail?: string) {
-        this.events.push({ sequence: this.events.length + 1, tool, status, parameters, detail });
+        this.events.push({ sequence: ++this.sequence, tool, status, parameters, detail });
         this.onChange?.();
     }
+
     private deny(tool: string, reason: string): unknown {
         this.event(tool, 'blocked', undefined, reason);
         return { error: reason, session: this.modelState() };
     }
 
-    private defineTask(input: unknown, requireVerbatimSources: boolean): unknown {
-        if (this.task) return this.deny('define_task', 'Task is immutable once defined.');
-        const parsed = taskSchema.safeParse(input);
-        if (!parsed.success) return this.deny('define_task', parsed.error.message);
-        const proposed = parsed.data;
-        if (requireVerbatimSources) {
-            for (const [field, value] of Object.entries(proposed.hard_filters)) {
-                if (Array.isArray(value) && !value.length) continue;
-                const source = proposed.filter_sources.find(item => item.field === field);
-                if (!source || !this.query.toLowerCase().includes(source.quote.toLowerCase()))
-                    return this.deny('define_task', `Filter ${field} needs a verbatim source in the original query. Omit unspecified filters entirely.`);
-                if (typeof value === 'number' && !(source.quote.match(/\d+(?:\.\d+)?/g) || []).some(n => Number(n) === value))
-                    return this.deny('define_task', `Filter ${field}=${value} is not supported by its quoted numeric constraint.`);
-                if (Array.isArray(value) && value.some(item => !source.quote.toLowerCase().includes(item.toLowerCase())))
-                    return this.deny('define_task', `Every value in filter ${field} must occur in its quoted source. Semantic normalization belongs in a trusted adapter, not the Agent.`);
-            }
-        }
-        this.task = proposed;
-        this.event('define_task', 'completed', { ...this.task, source: requireVerbatimSources ? 'agent_compiled' : 'oracle_task_spec' });
-        if (this.task.mode === 'exact') this.end('unsupported', 'This endpoint discovers regions; exact record retrieval requires a separate workflow.');
-        return { session: this.modelState() };
-    }
-
-    /** Seed a separately labelled benchmark annotation without pretending it was
-     * compiled verbatim by the product Agent. All later invariants are identical. */
-    seedOracleTask(input: unknown): unknown {
-        if (this.checkBudget()) return { terminal: this.terminal };
-        this.actions++;
-        return this.defineTask(input, false);
-    }
-
-    async act(name: ActionName, input: unknown, executor: Executor): Promise<unknown> {
-        if (this.busy) return this.deny(name, 'Observe the current tool result before another action.');
-        if (this.checkBudget()) return { terminal: this.terminal };
-        this.actions++;
-        const parsed = actionSchemas[name].safeParse(input);
-        if (!parsed.success) return this.deny(name, parsed.error.message);
-        if (name === 'define_task') return this.defineTask(parsed.data, true);
-        if (!this.task) return this.deny(name, 'Define the task before searching.');
-        if (name === 'finish_search') return this.finish(actionSchemas.finish_search.parse(parsed.data));
-        if (this.finalizationReserved) return this.deny(name, 'Finalization tokens are reserved. Do not collect more evidence; call finish_search with reason budget_reserve.');
-        const targetMet = this.accepted().length >= this.task.target_count;
-        if (targetMet && ['scan_projection', 'inspect_regions', 'subdivide_region'].includes(name))
-            return this.deny(name, 'The accepted target is already met. Do not collect more evidence; compare if required, then call finish_search.');
-        const data = parsed.data as Record<string, unknown>;
-        let args: Record<string, unknown>;
-        let requested: Candidate[] = [];
-        if (name === 'scan_projection') {
-            const grid = data.grid_size as number;
-            if (this.scans.has(grid) || this.scans.size >= this.limits.scans) return this.deny(name, 'Duplicate scan scale or scan budget exhausted.');
-            if ([...this.candidates.values()].some(c => c.status === 'proposed')) return this.deny(name, 'Inspect existing proposals before scanning again.');
-            args = { grid_size: grid, top_k: 16 };
-        } else if (name === 'subdivide_region') {
-            const c = this.candidates.get(data.parent_id as string);
-            if (!c || !this.canRefine(c)) return this.deny(name, 'Parent must be an eligible relevant, mixed inspected circle; check can_refine.');
-            requested = [c];
-            args = { parent_id: c.id, center_x: c.center_x, center_y: c.center_y, radius: c.radius, subdivisions: 3, top_k: 6 };
-        } else {
-            const requestedIds = data.region_ids as string[];
-            if (new Set(requestedIds).size !== requestedIds.length) return this.deny(name, 'Duplicate region IDs in one batch.');
-            for (const id of requestedIds) {
-                const c = this.candidates.get(id);
-                if (!c) return this.deny(name, `Unknown candidate ID: ${id}`);
-                requested.push(c);
-            }
-            if (name === 'inspect_regions') {
-                const available = this.available();
-                const remaining = this.limits.inspected - this.inspected;
-                if (!remaining) { this.end('budget_exhausted', 'circle inspection budget reached'); return { terminal: this.terminal }; }
-                if (requested.some(c => !available.includes(c))) return this.deny(name, 'Circle already inspected or retry limit reached.');
-                if (requested.length > remaining) return this.deny(name, `Only ${remaining} circle inspections remain.`);
-                if (requested.length < Math.min(3, available.length, remaining)) return this.deny(name, 'Inspect at least three candidates together, or all available if fewer remain.');
-                if (this.reserveFinalizationForInspection(requested.length))
-                    return this.deny(name, 'Finalization tokens are reserved before this inspection batch. Call finish_search with reason budget_reserve.');
-                args = { regions: requested.map(c => ({ id: c.id, center_x: c.center_x, center_y: c.center_y, radius: c.radius })), sample_size: 12, intent: this.evidenceIntent() };
-            } else {
-                if (requested.some(c => c.status !== 'accepted')) return this.deny(name, 'Compare accepted evidence only.');
-                const key = requestedIds.slice().sort().join('|');
-                if (this.comparisonResults.some(r => r.result?.comparison_key === key)) return this.deny(name, 'This comparison was already completed.');
-                args = { regions: requested.map(c => ({ id: c.id, center_x: c.center_x, center_y: c.center_y, radius: c.radius })) };
-            }
-        }
-        args.search_context = { version: 1, hard_filters: this.task.hard_filters, semantic_intent: this.evidenceIntent() };
-        this.event(name, 'accepted', { ...data, ...args });
-        const call: ToolCall = { id: `action-${this.actions}`, type: 'function', function: { name, arguments: JSON.stringify(args) } };
-        this.busy = true;
-        let result: ToolResult;
-        try { result = await executor.execute(call); }
-        catch (e) { result = { name, call_id: call.id, result: null, error: e instanceof Error ? e.message : String(e) }; }
-        finally { this.busy = false; }
-        if (this.terminal) return { terminal: this.terminal }; // Never commit late responses after cancellation.
-        this.results.push(result);
-        if (result.error) {
-            this.event(name, 'failed', undefined, result.error);
-            this.end('runtime_error', `${name} could not produce evidence: ${result.error}`);
-            return { terminal: this.terminal };
-        }
-        if (name === 'scan_projection') {
-            this.scans.add(data.grid_size as number);
-            this.register(result.result?.regions);
-        } else if (name === 'subdivide_region') {
-            requested[0].refined = true; this.refinements++;
-            this.register(result.result?.children, requested[0]);
-        } else if (name === 'inspect_regions') {
-            this.inspected += requested.length;
-            const before = this.accepted().length;
-            let validCount = 0;
-            for (const c of requested) {
-                c.attempts++;
-                const raw = (result.result?.regions || []).find((r: { id: string }) => r.id === c.id);
-                this.recordTokens(Number(raw?.analyzer_usage?.total_tokens) || 0);
-                if (this.assess(c, raw)) validCount++;
-            }
-            // Failure batches carry no negative semantic evidence.
-            if (validCount === requested.length) this.lowProgress = this.accepted().length > before || requested.some(c => this.canRefine(c)) ? 0 : this.lowProgress + 1;
-            if (requested.every(c => c.status === 'failed' && c.attempts > this.limits.retries))
-                this.end('runtime_error', 'All circles in this batch failed after the bounded retry.');
-        } else {
-            result.result.comparison_key = requested.map(c => c.id).sort().join('|');
-            this.comparisonResults.push(result);
-        }
-        this.event(name, 'completed');
-        this.checkBudget();
-        return { observation: name === 'compare_regions' ? result.result : undefined, session: this.modelState() };
-    }
-
-    private evidenceIntent(): string {
-        return `Original request (global search goal): ${this.query}\nEvaluate this circle as ONE finding: ${this.task?.finding_unit}\nLocal relevance requirements: ${this.task?.evidence_requirements.join('; ')}\nHard metadata filters: ${JSON.stringify(this.task?.hard_filters)}\nDo not penalize this circle for failing to contain the requested number of different findings. Count and inter-region diversity are handled by the main agent.`;
-    }
-    private register(rows: unknown, parent?: Candidate): void {
-        if (!Array.isArray(rows)) throw new Error('Spatial tool did not return a candidate array');
-        for (const r of rows) {
-            const c: Candidate = { id: String(r.id || ''), center_x: r.center_x, center_y: r.center_y, radius: r.radius ?? r.suggested_radius,
-                depth: parent ? parent.depth + 1 : 0, parent_id: parent?.id, population: Number.isFinite(r.density) ? r.density : null,
-                status: 'proposed', attempts: 0, refined: false, acceptance_tier: null };
-            if (!c.id || ![c.center_x, c.center_y, c.radius].every(Number.isFinite) || c.radius <= 0) continue;
-            if (parent && (c.radius >= parent.radius || distance(c, parent) + c.radius > parent.radius + 1e-7)) continue;
-            if ([...this.candidates.values()].some(existing => sameCircle(c, existing))) continue;
-            if (this.candidates.has(c.id)) continue;
-            this.candidates.set(c.id, c);
-        }
-    }
-    private assess(c: Candidate, raw: Record<string, unknown> | undefined): boolean {
-        const reviews = Array.isArray(raw?.reviews) ? raw.reviews : [];
-        const reviewIds = [...new Set(reviews.map((r: { id?: number }) => r.id).filter((id): id is number => Number.isSafeInteger(id)))];
-        const f = this.task!.hard_filters;
-        const scopeMismatch = reviews.some((r: Record<string, unknown>) =>
-            f.countries?.length && !f.countries.includes(String(r.country)) ||
-            f.varieties?.length && !f.varieties.includes(String(r.variety)) ||
-            Object.entries({ min_price: f.min_price, max_price: f.max_price, min_points: f.min_points, max_points: f.max_points }).some(([key, limit]) => {
-                if (limit === undefined) return false;
-                const value = r[key.endsWith('price') ? 'price' : 'points'];
-                return typeof value !== 'number' || !Number.isFinite(value) || (key.startsWith('min') ? value < limit : value > limit);
-            }));
-        if (scopeMismatch) { c.status = 'failed'; c.error = 'sample_scope_mismatch'; this.failures++; return false; }
-        const failed = !raw || raw.analysis_failed || !score(raw.purity) || !score(raw.intent_match) ||
-            !(raw.hard_constraint_match === true || raw.hard_constraint_match === false) || reviewIds.length < 3;
-        if (failed) {
-            if (raw?.density === 0 && !raw?.analysis_failed) { c.status = 'rejected'; c.error = 'empty circle'; return true; }
-            c.status = 'failed'; c.error = String(raw?.analyzer_status || 'invalid or insufficient evidence'); this.failures++; return false;
-        }
-        const e: Evidence = { category: String(raw.category || ''), themes: strings(raw.themes), quotes: strings(raw.quotes),
-            purity: raw.purity as number, intent_match: raw.intent_match as number, hard_constraint_match: raw.hard_constraint_match as boolean,
-            sample_size: reviewIds.length, review_ids: reviewIds, purity_rationale: String(raw.purity_rationale || ''), intent_match_rationale: String(raw.intent_match_rationale || '') };
-        c.evidence = e; c.error = undefined;
-        const duplicate = this.accepted().some(other => other.id !== c.id && this.semanticDuplicate(c, other));
-        c.acceptance_tier = !e.hard_constraint_match || !e.category.trim() ? null :
-            e.purity >= .70 && e.intent_match >= .75 ? 'strong' :
-                e.purity >= .75 && e.intent_match >= .65 ? 'soft' :
-                    this.task?.mode === 'exploration' && !duplicate && e.purity >= .70 && e.intent_match >= .60 ? 'diversity' : null;
-        c.status = c.acceptance_tier && !(this.task?.require_diversity && duplicate) ? 'accepted' :
-            e.hard_constraint_match && e.intent_match >= .60 ? 'frontier' : 'rejected';
-        if (duplicate) c.error = 'duplicate evidence/theme heuristic; not counted as a distinct finding';
-        return true;
-    }
-    private finish(data: { reason: string; finding_ids: string[]; explanation: string; distinctions: string[] }): unknown {
-        const ids = data.finding_ids;
-        if (new Set(ids).size !== ids.length || ids.some(id => this.candidates.get(id)?.status !== 'accepted')) return this.deny('finish_search', 'Each finding ID must refer to distinct accepted evidence.');
-        const sufficient = ids.length >= this.task!.target_count;
-        if (data.reason === 'sufficient_evidence' && !sufficient) return this.deny('finish_search', 'Requested target has not been met.');
-        if (this.task!.require_diversity && ids.length > 1 && data.distinctions.length !== ids.length) return this.deny('finish_search', 'Give one evidence-based distinction per selected finding.');
-        if (this.task!.mode === 'comparison' && sufficient && !this.comparisonResults.some(r => ids.every(id => r.result.comparison_key.split('|').includes(id)))) return this.deny('finish_search', 'Compare the selected findings before claiming comparison success.');
-        const reserveAllowsPartial = this.finalizationReserved && data.reason === 'budget_reserve';
-        if (!sufficient && !reserveAllowsPartial) {
-            if (this.accepted().length >= this.task!.target_count) return this.deny('finish_search', 'Enough accepted evidence exists; select it before stopping.');
-            if ([...this.candidates.values()].some(c => this.canRefine(c))) return this.deny('finish_search', 'An actionable relevant mixed frontier remains.');
-            if (!this.scans.size) return this.deny('finish_search', 'No spatial evidence has been collected.');
-            if (data.reason === 'diminishing_returns' && this.lowProgress < 2) return this.deny('finish_search', 'Two complete valid low-progress batches are required.');
-            if (data.reason === 'candidates_exhausted' && (this.available().length || this.scans.size < this.limits.scans)) return this.deny('finish_search', 'Generated candidate actions or another scan scale remain.');
-            if (data.reason === 'sufficient_evidence') return this.deny('finish_search', 'Insufficient evidence.');
-        }
-        this.selectedIds.push(...ids); this.distinctions = data.distinctions; this.explanation = data.explanation;
-        this.event('finish_search', 'completed', data);
-        const unresolvedFailures = [...this.candidates.values()].some(c => c.status === 'failed');
-        this.end(sufficient ? 'success' : unresolvedFailures ? 'runtime_error' : ids.length ? 'partial_success' : 'no_evidence', data.reason);
-        return { terminal: this.terminal };
-    }
     modelState() {
-        const targetMet = Boolean(this.task && this.accepted().length >= this.task.target_count);
-        return { contract: CONTRACT_VERSION, bounds: this.bounds, task: this.task, terminal: this.terminal,
-            remaining: { actions: this.limits.actions - this.actions, scans: this.limits.scans - this.scans.size, circles: this.limits.inspected - this.inspected, tokens: this.limits.tokens - this.tokens, finalization_reserved: this.finalizationReserved },
-            low_progress_batches: this.lowProgress,
-            target_met: targetMet,
-            next_required: targetMet ? this.task?.mode === 'comparison' && !this.comparisonResults.length ? 'compare_regions' : 'finish_search' : this.finalizationReserved ? 'finish_search' : null,
-            candidates: [...this.candidates.values()].map(c => ({
-                id: c.id, xy: [c.center_x, c.center_y], radius: c.radius, parent_id: c.parent_id,
-                status: c.status, population: c.population, can_refine: this.canRefine(c),
-                retry_available: c.status === 'failed' && c.attempts <= this.limits.retries,
-                category: c.evidence?.category, purity: c.evidence?.purity, intent_match: c.evidence?.intent_match,
-                constraint_match: c.evidence?.hard_constraint_match,
-                themes: c.status === 'rejected' ? undefined : c.evidence?.themes,
-                rationale: c.status === 'frontier' || c.status === 'accepted' ? c.evidence?.intent_match_rationale.slice(0, 200) : undefined,
-                error: c.error
-            })) };
+        const ledger = this.probes.slice(-20).map(probe => ({
+            id: probe.id, region: probe.region, support: probe.support, source: probe.source, judged: probe.judged
+        }));
+        return {
+            contract: CONTRACT_VERSION,
+            bounds: this.bounds,
+            playbook: this.playbook,
+            terminal: this.terminal,
+            awaiting_judge: this.awaitingJudge,
+            sql_this_turn: this.sqlThisTurn,
+            refinements_used: this.refinements,
+            non_improving_searches: this.nonImproving,
+            must_stop_searching: this.mustStopSearching,
+            next_required: this.mustStopSearching || this.actions >= 33 ? 'complete_answer' : this.awaitingJudge ? 'flexible_search' : null,
+            probed_regions: ledger,
+            judgments: this.judgments.map(item => ({ id: item.id, category: item.category, intent_fit: item.intent_fit, intent_fit_label: item.intent_fit_label, region: item.region }))
+        };
     }
+
     snapshot() {
-        return { contract: CONTRACT_VERSION, task: this.task, terminal: this.terminal, must_stop: Boolean(this.terminal), stop_reason: this.terminal?.reason || null,
-            objective: { target_accepted_regions: this.task?.target_count || 0 },
-            inspected_region_count: this.inspected, accepted_region_count: this.accepted().length,
-            relevant_themes: this.accepted().flatMap(c => c.evidence?.themes || []),
-            frontier: [...this.candidates.values()].filter(c => c.status === 'frontier'),
-            candidates: [...this.candidates.values()].map(c => ({ ...c, ...c.evidence, recommended_action: c.status === 'accepted' ? 'accept' : c.status === 'rejected' ? 'reject' : c.status, analysis_failed: c.status === 'failed' })),
-            remaining: { toolCalls: Math.max(0, this.limits.actions - this.actions), modelTokens: Math.max(0, this.limits.tokens - this.tokens), finalizationReserved: this.finalizationReserved },
-            elapsed_ms: this.now() - this.started, no_progress_rounds: this.lowProgress, failure_attempts: this.failures,
-            trajectory: [...this.events], selected_ids: [...this.selectedIds] };
+        return {
+            contract: CONTRACT_VERSION,
+            task: { playbook: this.playbook },
+            terminal: this.terminal,
+            must_stop: Boolean(this.terminal),
+            stop_reason: this.terminal?.reason || null,
+            candidates: this.judgments.map(item => ({
+                id: item.id, category: item.category, intent_fit: item.intent_fit, status: item.intent_fit >= 0.8 ? 'accepted' : item.intent_fit >= 0.55 ? 'frontier' : 'rejected',
+                recommended_action: item.intent_fit >= 0.8 ? 'accept' : item.intent_fit < 0.55 ? 'reject' : 'bounded'
+            })),
+            frontier: this.probes.filter(probe => !probe.judged),
+            selected_ids: [...this.cited],
+            accepted_region_count: this.judgments.filter(item => item.intent_fit >= 0.8).length,
+            trajectory: [...this.events],
+            elapsed_ms: this.now() - this.started
+        };
     }
+
     answer(): string {
         if (!this.terminal) throw new Error('Cannot answer before terminal state');
-        const lines = this.selectedIds.map((id, i) => {
-            const e = this.candidates.get(id)?.evidence;
-            if (!e) return '';
-            return `${i + 1}. ${e.category} [${id}] — purity ${e.purity.toFixed(2)}, intent ${e.intent_match.toFixed(2)}. ${e.intent_match_rationale} ${this.distinctions[i] || ''}`;
-        });
-        return [`Search result: ${this.terminal.state}. ${this.explanation || this.terminal.reason}`, ...lines,
-            lines.length ? '{{Verified projection findings}}' : 'No verified matching regions were obtained.',
-            'Scores describe the sampled evidence, not every record in a circle.'].join('\n\n');
+        const cards = this.cited.map(category => this.judgments.find(item => item.category === category)).filter((item): item is Judgment => Boolean(item));
+        const lines = [this.explanation || this.terminal.reason, ...cards.map(card => `{{${card.category}}}`)];
+        if (this.bounded) lines.push('Scope: this is a bounded reading of the sampled rings, not a census of the map.');
+        if (!cards.length) lines.push('No accepted ring was strong enough to name.');
+        return lines.join('\n\n');
     }
+
     presentation(): ToolResult | null {
         if (!this.terminal) throw new Error('Presentation requires terminal state');
-        const ids = [...new Set(this.selectedIds.flatMap(id => this.candidates.get(id)?.evidence?.review_ids || []))];
-        return ids.length ? { name: 'save_selection', call_id: 'presentation', result: { saved: true, label: 'Verified projection findings', record_ids: ids, controller_generated: true } } : null;
+        const cards = this.cited.map(category => this.judgments.find(item => item.category === category)).filter((item): item is Judgment => Boolean(item));
+        const ids = [...new Set(cards.flatMap(card => card.evidence_ids))];
+        if (!ids.length) return null;
+        return { name: 'save_selection', call_id: 'presentation', result: { saved: true, label: cards[0]?.category || 'Accepted ring', record_ids: ids, categories: cards.map(card => card.category), controller_generated: true } };
     }
 }
+
+function searchShape(name: string, data: Record<string, unknown>): string {
+    if (name === 'sql_query') return `sql:${String(data.sql).replace(/\s+/g, ' ').trim().toLowerCase()}`;
+    const region = data.region as Region | undefined;
+    const box = region ? [region.min_x, region.max_x, region.min_y, region.max_y].map(value => value.toFixed(4)).join(',') : '-';
+    const terms = [String(data.query || ''), ...((data.terms as string[] | undefined) || [])].map(term => term.toLowerCase().trim()).filter(Boolean).sort().join('|');
+    return `${name}:${box}:${terms}:${String(data.prompt || '')}`;
+}
+
+function sameRegion(a: Region, b: Region): boolean {
+    return [a.min_x - b.min_x, a.max_x - b.max_x, a.min_y - b.min_y, a.max_y - b.max_y].every(delta => Math.abs(delta) < 1e-6);
+}
+
 export type SearchPolicySnapshot = ReturnType<SearchSession['snapshot']>;

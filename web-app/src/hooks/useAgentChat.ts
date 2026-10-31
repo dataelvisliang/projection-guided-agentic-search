@@ -27,7 +27,7 @@ const INITIAL_MESSAGE: Message = {
     role: 'assistant',
     content: `Hello! I'm your AI Sommelier and Wine Data Analyst.
 
-I can search the wine atlas by scanning the semantic landscape, probing several circles in parallel, refining promising areas, and comparing verified findings.
+I search the wine map by region: I locate a topic on the map, check the reviews inside that area, and answer from the areas that actually match.
 
 Try asking: "Find me good value reds under $20" or "What are the common flavors in Tuscan wines?"`
 };
@@ -60,7 +60,8 @@ User question: ${userMessage}`;
 function extractHighlightIds(toolResults: ToolResult[]): number[] {
     const ids = new Set<number>();
     for (const result of toolResults) {
-        for (const review of result.result?.reviews || []) if (typeof review.id === 'number') ids.add(review.id);
+        for (const review of result.result?.reviews || result.result?.rows || []) if (typeof review.id === 'number') ids.add(review.id);
+        for (const id of result.result?.evidence_ids || result.result?.highlight_ids || []) if (typeof id === 'number') ids.add(id);
         for (const region of result.result?.regions || []) {
             for (const review of region.reviews || []) if (typeof review.id === 'number') ids.add(review.id);
         }
@@ -90,8 +91,13 @@ export function useAgentChat(_coordinator: Coordinator | null) {
 
     const applyRuntimeEffects = useCallback((toolResults: ToolResult[]) => {
         for (const result of toolResults) {
-            if (result.name === 'inspect_regions' && Array.isArray(result.result?.regions)) {
-                inspectedRegionsCacheRef.current.push(...result.result.regions);
+            if (result.name === 'flexible_search' && result.result?.category) {
+                inspectedRegionsCacheRef.current.push({
+                    ...result.result,
+                    review_ids: result.result.evidence_ids || [],
+                    reviews: (result.result.rows || []).map((row: { id: number; excerpt?: string }) => ({ id: row.id, text: row.excerpt })),
+                    intent_match: result.result.intent_fit
+                });
             }
             if (result.name === 'filter_records' && Array.isArray(result.result?.reviews)) {
                 const reviews = result.result.reviews;

@@ -1,5 +1,5 @@
 /**
- * Live integration pilot for the agent-driven PAR contract.
+ * Live integration pilot for the Topic Ring Probe contract.
  *
  * Run from web-app:
  *   npm exec -- tsx ../benchmark/scripts/run_sdk_par_pilot.ts
@@ -11,7 +11,6 @@ import { fileURLToPath } from 'node:url';
 
 import analyzerHandler from '../../web-app/api/analyzer';
 import { runProjectionAgent } from '../../web-app/api/agentRuntime';
-import { taskSchema } from '../../web-app/src/agent/searchContract';
 
 type Query = {
     query_id: string;
@@ -21,21 +20,6 @@ type Query = {
     target_count?: number;
     hard_constraints?: Record<string, unknown>;
 };
-
-function benchmarkTaskSpec(query: Query) {
-    const constraints = query.hard_constraints || {};
-    const hardFilters = {
-        countries: typeof constraints.country === 'string' ? [constraints.country] : undefined,
-        varieties: typeof constraints.variety === 'string' ? [constraints.variety] : undefined,
-        min_points: typeof constraints.min_points === 'number' ? constraints.min_points : undefined,
-        max_points: typeof constraints.max_points === 'number' ? constraints.max_points : undefined,
-        min_price: typeof constraints.min_price === 'number' ? constraints.min_price : undefined,
-        max_price: typeof constraints.max_price === 'number' ? constraints.max_price : undefined
-    };
-    return taskSchema.parse({ mode: query.task_type, target_count: query.target_count, finding_unit: 'one coherent semantic region matching the requested theme or style',
-        require_diversity: query.task_type === 'exploration' || query.task_type === 'comparison',
-        hard_filters: JSON.parse(JSON.stringify(hardFilters)), filter_sources: Object.entries(hardFilters).filter(([, v]) => v !== undefined).map(([field]) => ({ field, quote: query.query })), evidence_requirements: [query.intent || query.query] });
-}
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const outputDir = path.join(root, 'benchmark', 'runs', 'sdk-pilot');
@@ -115,7 +99,7 @@ async function runQuery(query: Query, tracePath: string) {
             messages: [{ role: 'user', content: query.query }],
             origin: 'http://sdk-pilot.local',
             signal: controller.signal,
-            taskSpec: process.argv.includes('--oracle-task-spec') ? benchmarkTaskSpec(query) : undefined,
+            taskSpec: process.argv.includes('--oracle-task-spec') ? { unsupported: true } : undefined,
             onTrace: event => { traceWrites = traceWrites.then(() => appendFile(tracePath, `${JSON.stringify({ query_id: query.query_id, ...event as object })}\n`, 'utf8')); }
         });
     } finally {
@@ -125,9 +109,7 @@ async function runQuery(query: Query, tracePath: string) {
     const candidates = policy.candidates as unknown as Array<Record<string, unknown>>;
     const accepted = candidates.filter(candidate => candidate.recommended_action === 'accept');
     const rejected = candidates.filter(candidate => candidate.recommended_action === 'reject');
-    const batchInspection = result.toolResults.some(tool =>
-        tool.name === 'inspect_regions' && Array.isArray(tool.result?.regions) && tool.result.regions.length >= 3
-    );
+    const judgedRing = result.toolResults.some(tool => tool.name === 'flexible_search' && typeof tool.result?.intent_fit === 'number');
     return {
         query_id: query.query_id,
         query: query.query,
@@ -148,15 +130,14 @@ async function runQuery(query: Query, tracePath: string) {
         selected_ids: policy.selected_ids,
         failed: candidates.filter(candidate => candidate.status === 'failed'),
         latency_ms: Date.now() - started,
-        contract_pass: result.toolSequence.includes('scan_projection') &&
-            batchInspection &&
+        contract_pass: result.toolSequence.includes('load_workflow_playbook') &&
+            judgedRing &&
+            result.toolSequence.includes('complete_answer') &&
             ['success', 'partial_success', 'no_evidence', 'budget_exhausted'].includes(result.terminal.state) &&
-            !result.toolSequence.includes('save_selection') &&
             policy.must_stop && policy.stop_reason === result.terminal.reason &&
-            (result.terminal.state !== 'success' || policy.selected_ids.length >= (policy.task?.target_count || Infinity)) &&
             result.content.trim().length >= 80,
         task_success: result.terminal.state === 'success',
-        runtime: 'par-agent-v3',
+        runtime: 'topic-ring-probe-v1',
         models: {
             agent: process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash',
             analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash'
@@ -190,7 +171,7 @@ async function main(): Promise<void> {
                     stop_reason: `runner_failure:${error instanceof Error ? error.name : 'unknown'}`,
                     terminal_state: 'runtime_error',
                     final_answer: '', tokens: null, latency_ms: Date.now() - started,
-                    contract_pass: false, task_success: false, runtime: 'par-agent-v3',
+                    contract_pass: false, task_success: false, runtime: 'topic-ring-probe-v1',
                     models: {
                         agent: process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash',
                         analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash'
