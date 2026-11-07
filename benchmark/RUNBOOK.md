@@ -15,17 +15,15 @@ Run every system on the same query split and seeds `17`, `29`, and `43`. Enforce
 
 Write one JSON object per `(query_id, system_id, seed)` to `benchmark/runs/<system_id>.jsonl`. The format is defined in `schemas/run.schema.json`.
 
-### Development-only PAR pilot
+### Development pilot
 
-Current contract: `par-agent-v3`, recorded in `configs/par_agent_v3.json`. Run from `web-app`, using the same task compiler as chat:
+Run the current Topic Ring Probe runtime from `web-app`:
 
 ```powershell
 npm exec -- tsx ../benchmark/scripts/run_sdk_par_pilot.ts wine-dev-005 wine-dev-006 wine-dev-010
 ```
 
-The Agent defines a sourced task, scans, batch-inspects, optionally refines/compares, then requests finish. A one-batch success is valid. `contract_pass` measures the protocol; `task_success` measures the target terminal; neither measures human relevance. Inspect the compiled task and the evidence, not just the sequence.
-
-An optional `--oracle-task-spec` uses benchmark annotations as additional input and is explicitly labeled `oracle_task_spec`. It is not the product gate. Live runs write a completed JSONL plus incremental `.trace.jsonl`; costs remain null when unreported. Do not use the legacy Python runner for v3: it embeds a historical loop and obsolete prompt contract.
+`contract_pass` measures the protocol. `task_success` measures the terminal state. Neither measures human relevance. Inspect the evidence, not just the tool sequence. `--oracle-task-spec` is outside this runtime and ends as unsupported. Live runs write a completed JSONL plus incremental `.trace.jsonl`. Costs stay null when the provider does not report a price. Do not use the legacy Python runner or `configs/par_agent_v3.json` for new results; those describe the retired circle planner.
 
 To debug thresholds without polluting the blind benchmark pool, prepare a calibration sheet from a pilot run:
 

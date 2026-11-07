@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dataelvisliang/Embedding-Atlas-Agent.git"
+    "url": "https://github.com/dataelvisliang/projection-guided-agentic-search.git"
   },
   "type": "module",
   "scripts": {

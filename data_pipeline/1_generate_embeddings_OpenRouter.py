@@ -73,7 +73,7 @@ def get_embeddings(texts, model, retries=3):
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/dataelvisliang/Embedding-Atlas-Agent",
+        "HTTP-Referer": "https://github.com/dataelvisliang/projection-guided-agentic-search",
     }
     data = {
         "model": model,

@@ -1,20 +1,14 @@
 # Documentation
 
-Technical documentation for the Atlas Agent project.
+Documentation for projection-guided agentic search.
 
 ## Contents
 
 | Document | Description |
-|----------|-------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Detailed system architecture with Mermaid diagrams |
-| [ROADMAP.md](ROADMAP.md) | Feature roadmap and implementation status |
-| [DEBUGGING_REPORT.md](DEBUGGING_REPORT.md) | Historical debugging notes (Vite/worker issues) |
+| --- | --- |
+| [PROJECTION_AGENT_SEARCH.md](PROJECTION_AGENT_SEARCH.md) | Current Topic Ring Probe contract: tools, evidence, scope, and budgets |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Runtime ownership and request flow |
+| [ROADMAP.md](ROADMAP.md) | Remaining research and product work |
+| [DEBUGGING_REPORT.md](DEBUGGING_REPORT.md) | Historical Vite and worker notes |
 
-## Quick Links
-
-- **[System Overview](ARCHITECTURE.md#system-overview)** - High-level architecture diagram
-- **[Atlas Widget Internals](ARCHITECTURE.md#atlas-widget-internals)** - How the visualization works
-- **[Agent Architecture](ARCHITECTURE.md#agent-architecture)** - Agent loop and tool execution
-- **[Tool Definitions](ARCHITECTURE.md#tool-definitions)** - Available agent tools
-- **[Current Capabilities](ROADMAP.md#current-capabilities-v01)** - What's implemented
-- **[Planned Features](ROADMAP.md#planned-features)** - What's coming next
+The search contract is the source for current behavior. The debugging report records an earlier frontend issue and is not a description of the agent.

@@ -1,4 +1,4 @@
-# Atlas Agent architecture
+# Projection-guided search architecture
 
 ```mermaid
 flowchart TD

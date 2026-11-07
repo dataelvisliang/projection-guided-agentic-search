@@ -3,8 +3,8 @@ import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
-  // Use "/" for Vercel, "/Embedding-Atlas-Agent/" for GitHub Pages
-  base: process.env.VERCEL ? "/" : "/Embedding-Atlas-Agent/",
+  // Use "/" for Vercel, and the repository name for GitHub Pages.
+  base: process.env.VERCEL ? "/" : "/projection-guided-agentic-search/",
   server: {
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
@@ -12,10 +12,7 @@ export default defineConfig({
     },
     fs: {
       // Allow serving files from linked packages
-      allow: [
-        '.',
-        'C:/Users/liang/Desktop/ML Notebooks/embedding-atlas'
-      ],
+      allow: ['.'],
     },
   },
   plugins: [react()],

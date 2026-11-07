@@ -1,5 +1,7 @@
 # Projection-Augmented Retrieval Benchmark
 
+The current agent runtime is Topic Ring Probe v2 (`benchmark/configs/topic_ring_probe_v2.json`). Run it with the [runbook](RUNBOOK.md). The frozen `wine-par-v1` benchmark and the circle-planner pilot below are historical comparison material. They do not validate the current runtime.
+
 This benchmark evaluates whether an LLM agent benefits from treating a 2D embedding projection as an operational search space.
 
 Version `v1` contains 30 Wine Atlas queries across exact retrieval, semantic retrieval, open-ended exploration, and regional comparison. Ten development queries may be used for threshold tuning; twenty test queries are frozen for final reporting.
