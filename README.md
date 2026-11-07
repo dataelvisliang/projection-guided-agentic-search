@@ -1,138 +1,78 @@
-# Wine Review Atlas - Sommelier AI Agent
+# Projection-Guided Agentic Search
 
-An interactive visualization and analysis tool for **130k Wine Reviews** using Apple's Embedding Atlas with an AI-powered Multi-Agent system.
+An agent explores a two-dimensional embedding map by locating candidate regions, judging their review text, and answering from validated evidence. The demo uses **130k wine reviews** and Apple's Embedding Atlas.
 
 ![Atlas Agent](images/Atlas%20Agent.png)
 
-## Sommelier Agent Demo
+The projection is a candidate-generation space, not semantic ground truth. Runtime search uses map coordinates, lexical retrieval and structured data; it does not call an embedding service or vector index.
 
-The web app features a sophisticated **Multi-Agent Architecture** that enables autonomous exploration of the wine landscape, acting as your personal AI Sommelier.
+## How it works
 
-### Features
+1. **Choose a workflow.** Load the relevant Topic Ring Probe playbook before searching.
+2. **Locate candidate regions.** Use normalized density grids, the user's selected scope, or lexical seed islands. A ring is a bounded rectangle.
+3. **Judge the evidence.** `flexible_search` runs diversified recall inside one region, then asks an Analyzer to assess intent fit and content coherence.
+4. **Adapt the search.** Accept evidence, refine a mixed ring once, visit a sibling, or discard an off-intent region. SearchSession validates transitions and budgets; the model chooses the route.
+5. **Answer with the right evidence.** Accepted categories become separate interactive cards. Exact SQL analytics and direct row lookups use their own evidence paths. Thin coverage yields a bounded partial answer.
 
-| Feature             | Description                                                                               |
-| ------------------- | ----------------------------------------------------------------------------------------- |
-| **Sommelier Agent** | **Orchestrator Agent** that understands varietals, regions, and price points              |
-| **Flavor Analyzer** | **Analyzer Agent** that extracts flavor notes, acidity, tannins, and finish from clusters |
-| **Agentic Search**  | Projection-guided loop: coarse grid scan → parallel circular probes → refine/compare → save |
-| **Vintage Memory**  | Bookmarks interesting wines with **Category Cards** (e.g., "Earthy Tuscan Reds")          |
-| **Interactive Map** | 2D semantic map of 130k wines where similar taste profiles are clustered together         |
+See [Topic Ring Probe](web-app/docs/PROJECTION_AGENT_SEARCH.md) for schemas, scope, provenance, stopping rules and implementation adaptations.
 
-### How It Works
-
-1.  **Task and Scan**: The Sommelier records explicit constraints with source quotes, then proposes circles at its chosen map scale.
-2.  **Parallel Circular Probes**: It places several true circular probes in one action and delegates their samples to the **Analyzer Agent**.
-3.  **Adaptive Traversal**: The main Agent chooses more circles, comparison, refinement or stopping from purity, intent and text evidence.
-4.  **Search Contract**: One session validates candidate provenance, immutable scope, budgets and terminal conditions. Runtime search uses XY, metadata and text without an embedding index.
-5.  **Curation**: Verified reviews are saved separately from retrieval and displayed as interactive Category Cards.
-
-The projection is treated as a candidate-generation space, not semantic ground truth. See [Projection-Guided Agentic Search](web-app/docs/PROJECTION_AGENT_SEARCH.md) for tool boundaries, geometry, stopping behavior, and evaluation hooks.
-
-### Architecture
+## Architecture
 
 ```mermaid
 flowchart TB
-    subgraph Frontend["React Frontend"]
-        Atlas["Embedding Atlas"]
-        Chat["Chat Widget"]
-        Memory["savedCategories Map<br/>(Client-Side Memory)"]
-
-        Atlas --> Chat
-        Memory --> Chat
-    end
-
-    subgraph Backend["Vercel Serverless"]
-        Orchestrator["/api/agent<br/>Sommelier Agent"]
-        Analyzer["/api/analyzer<br/>Flavor Analyzer"]
-        Tools["SearchSession + Tool Executor"]
-    end
-
-    subgraph LLM["OpenRouter API"]
-        Model["LLM Model (GLM-5.3-Flash by default)"]
-    end
-
-    Chat --> Orchestrator
-    Orchestrator --> Tools
-    Tools -->|"inspect_regions"| Analyzer
-    Analyzer -->|"summary"| Orchestrator
-    Orchestrator --> Model
+    UI["React + Embedding Atlas"] --> API["/api/agent · Agents SDK"]
+    API --> Session["SearchSession · contract validation"]
+    Session --> Tools["SQL · map_search · flexible_search"]
+    Tools --> DB["Scoped server DuckDB-WASM"]
+    Tools --> Analyzer["/api/analyzer · text judgment"]
+    API --> Model["OpenRouter · anthropic/claude-haiku-5.5"]
     Analyzer --> Model
-    Orchestrator -->|"save_selection"| Memory
-    Orchestrator -->|"final answer"| Chat
+    Session --> Evidence["Validated answer + separate category cards"]
+    Evidence --> UI
 ```
 
-#### Main Agent (Sommelier)
-
-The orchestrator agent that coordinates exploration and delegates analysis tasks.
-
-```mermaid
-flowchart LR
-    subgraph Tools["Available Tools"]
-        Define["define_task<br/>Freeze sourced intent"]
-        Scan["scan_projection<br/>Coarse candidates"]
-        Inspect["inspect_regions<br/>Parallel circles → Analyzer"]
-        Refine["subdivide_region<br/>Partition a parent region"]
-        Compare["compare_regions<br/>Contrast circles"]
-        Finish["finish_search<br/>Validated terminal request"]
-    end
-
-    Agent["Sommelier Agent<br/>/api/agent"] --> Tools
-    Tools --> Response["Final Answer<br/>with {{Category}} Cards"]
-```
-
-#### Sub-Agent (Analyzer)
-
-A specialized sub-agent that receives review data and extracts structured insights.
-
-```mermaid
-flowchart LR
-    Input["Reviews Array<br/>(from Main Agent)"] --> Analyzer["Analyzer Agent<br/>/api/analyzer"]
-    Analyzer --> LLM["LLM Call"]
-    LLM --> Output["Structured JSON:<br/>category, sentiment,<br/>themes, quotes"]
-```
+The browser owns selection and presentation. Selected IDs fix an immutable server query scope. Current-turn results can scope later tools via workspace result sets. A compact ring ledger carries navigation context into the next turn; historical judgments do not become fresh evidence.
 
 ## Capabilities
 
-- **Semantic Search**: Find wines by description (e.g., "barnyard funk", "cat pee on a gooseberry bush").
-- **SQL Analytics**: Aggregate stats by price, points (80-100), country, or winery via DuckDB-WASM.
-- **Cluster Inspector**: Deep dive into specific map regions to understand local styles.
-- **Value Finder**: Identify high-scoring wines at low price points.
+- Topic and flavor exploration using region-constrained text judgments.
+- Exact SQL counts and breakdowns by price, rating, variety and country.
+- Explicit literal/proxy counts, clearly separated from semantic prevalence.
+- Selected-subset exploration and direct review examples.
+- Category cards and map highlights grounded in tool-returned direct evidence.
 
-### Example Questions
+Example questions:
 
-- "Find me some bold red wines under $20 that taste like chocolate."
-- "What are the main differences between the Pinot Noirs in the top-left vs bottom-right clusters?"
-- "Show me the rating distribution for French wines."
-- "I like earthy, tannic wines. What do you recommend?"
+- "What are the common flavors in Tuscan wines?"
+- "How many French wines score at least 90 points and cost under $20?"
+- "Compare the themes in these selected reviews."
+- "Find examples of wines described as earthy and tannic."
 
-## Tech Stack
+## Tech stack
 
-| Component     | Technology                               |
-| ------------- | ---------------------------------------- |
-| Visualization | Apple Embedding Atlas                    |
-| Embeddings    | Qwen 3 (4B) via OpenRouter               |
-| Data Engine   | DuckDB-WASM + Mosaic                     |
-| Frontend      | React + TypeScript + Vite                |
-| Backend       | Vercel Serverless Functions              |
-| AI Agents     | Orchestrator + Analyzer (via OpenRouter) |
-| Dataset       | Wine Magazine (130k reviews)             |
+| Component | Technology |
+| --- | --- |
+| Map | Apple Embedding Atlas |
+| Embeddings | Qwen 3 Embedding (4B), generated offline |
+| Data engine | DuckDB-WASM + Mosaic |
+| Frontend | React + TypeScript + Vite |
+| Backend | Vercel serverless functions |
+| Agent loop | OpenAI Agents SDK via OpenRouter |
+| Agent and Analyzer default | `anthropic/claude-haiku-5.5` |
+| Dataset | Wine Magazine reviews |
 
-## Data Pipeline
+## Development and validation
 
-The project includes a robust Python pipeline to process the raw CSV into a visualization-ready format:
+From `web-app`, run `npm ci`, `npm test`, and `npm run build`. API calls require `OPENROUTER_API_KEY`. `OPENROUTER_MODEL` and `OPENROUTER_ANALYZER_MODEL` can override the defaults. `npm run dev` serves the frontend; Agent/Analyzer endpoints require a Vercel-compatible server.
 
-1.  `1_generate_embeddings_OpenRouter.py` - Generate embeddings from wine descriptions using Nomic API.
-2.  `2_reduce_dimensions.py` - Dimensionality reduction (UMAP) to project 768d vectors to 2D.
-3.  `regenerate_static_export.py` - Packages the processed `winemag_projected.parquet` for the web app.
+## Data pipeline
+
+`data_pipeline/1_generate_embeddings_OpenRouter.py` generates embeddings; `2_reduce_dimensions.py` projects them to two dimensions. `regenerate_static_export.py` packages the processed data for the web app. The embedding model is separate from the chat model.
 
 ## Benchmark
 
-The frozen `wine-par-v1` benchmark contains 30 stratified queries, seven system baselines, blind pooled-judgment protocols, trajectory conversion, and dependency-free evaluation for retrieval quality, thematic exploration, cost, and purity/intent calibration. See the [benchmark README](benchmark/README.md) and [runbook](benchmark/RUNBOOK.md).
+The frozen `wine-par-v1` benchmark contains 30 stratified queries, seven baselines, blind pooled judgments and retrieval/cost evaluation. See the [benchmark README](benchmark/README.md) and [runbook](benchmark/RUNBOOK.md). Historical circle-planner results describe earlier implementations; they do not validate the current Topic Ring Probe runtime.
 
 ## License
 
-This project is licensed for **non-commercial use only**.
-
-For commercial use, please contact the author for permission.
-
-See [LICENSE](LICENSE) for details.
+Non-commercial use only. Contact the author for commercial permission. See [LICENSE](LICENSE).

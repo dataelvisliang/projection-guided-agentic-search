@@ -1,5 +1,10 @@
 # Benchmark Runbook
 
+## Current Topic Ring Probe runtime
+
+The current implementation is `topic-ring-probe-v2`; configuration is `configs/topic_ring_probe_v2.json`. Earlier `par-agent-v3` circle-planner configs and reports are historical. Record fresh runs for the current runtime. Contract tests cover evidence and navigation invariants; they do not establish semantic retrieval quality. Exact SQL queries can complete without an Analyzer; bounded results are partial successes.
+
+
 ## 1. Freeze a system
 
 Record the Git commit, model identifier, prompts, tool schema, projection artifact, dataset checksum, and system configuration. Do not modify thresholds between test queries.

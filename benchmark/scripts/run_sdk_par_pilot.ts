@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import analyzerHandler from '../../web-app/api/analyzer';
+import { CONTRACT_VERSION } from '../../web-app/src/agent/searchContract';
 import { runProjectionAgent } from '../../web-app/api/agentRuntime';
 
 type Query = {
@@ -78,8 +79,12 @@ function compactCandidates(candidates: Array<Record<string, unknown>>) {
         return ({
         id: candidate.id,
         category: candidate.category,
-        purity: candidate.purity,
-        intent_match: candidate.intent_match,
+        coherence: candidate.coherence,
+        intent_fit: candidate.intent_fit,
+        region: candidate.region,
+        evidence_ids: candidate.evidence_ids,
+        sample_count: candidate.sample_count,
+        support: candidate.support,
         utility: candidate.utility,
         recommended_action: candidate.recommended_action,
         acceptance_tier: candidate.acceptance_tier,
@@ -118,8 +123,8 @@ async function runQuery(query: Query, tracePath: string) {
         accepted: compactCandidates(accepted),
         rejected: compactCandidates(rejected),
         frontier: compactCandidates(policy.frontier as unknown as Array<Record<string, unknown>>),
-        purity: Object.fromEntries(candidates.map(candidate => [candidate.id as string, candidate.purity])),
-        intent_match: Object.fromEntries(candidates.map(candidate => [candidate.id as string, candidate.intent_match])),
+        purity: Object.fromEntries(candidates.map(candidate => [candidate.id as string, candidate.coherence])),
+        intent_match: Object.fromEntries(candidates.map(candidate => [candidate.id as string, candidate.intent_fit])),
         stop_reason: result.terminal.reason,
         terminal_state: result.terminal.state,
         final_answer: result.content,
@@ -131,16 +136,16 @@ async function runQuery(query: Query, tracePath: string) {
         failed: candidates.filter(candidate => candidate.status === 'failed'),
         latency_ms: Date.now() - started,
         contract_pass: result.toolSequence.includes('load_workflow_playbook') &&
-            judgedRing &&
+            (judgedRing || ['exact_sql', 'row_examples', 'literal_proxy'].includes(result.terminal.reason)) &&
             result.toolSequence.includes('complete_answer') &&
             ['success', 'partial_success', 'no_evidence', 'budget_exhausted'].includes(result.terminal.state) &&
             policy.must_stop && policy.stop_reason === result.terminal.reason &&
             result.content.trim().length >= 80,
         task_success: result.terminal.state === 'success',
-        runtime: 'topic-ring-probe-v1',
+        runtime: CONTRACT_VERSION,
         models: {
-            agent: process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash',
-            analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash'
+            agent: process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5',
+            analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5'
         }
     };
 }
@@ -171,10 +176,10 @@ async function main(): Promise<void> {
                     stop_reason: `runner_failure:${error instanceof Error ? error.name : 'unknown'}`,
                     terminal_state: 'runtime_error',
                     final_answer: '', tokens: null, latency_ms: Date.now() - started,
-                    contract_pass: false, task_success: false, runtime: 'topic-ring-probe-v1',
+                    contract_pass: false, task_success: false, runtime: CONTRACT_VERSION,
                     models: {
-                        agent: process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash',
-                        analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash'
+                        agent: process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5',
+                        analyzer: process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5'
                     }
                 };
             }

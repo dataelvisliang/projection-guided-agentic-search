@@ -83,9 +83,10 @@ export function validateTopicSql(sql: string): string | null {
     const stripped = stripLeadingComments(sql).trim().replace(/;\s*$/, '');
     if (!/^(select|with)\b/i.test(stripped)) return 'SQL must start with SELECT or WITH';
     if (splitStatements(stripped).length !== 1) return 'Exactly one SQL statement is allowed';
-    const outside = stripStringsAndComments(stripped);
+    const outside = stripStringsAndComments(stripped).replace(/"([a-zA-Z_][\w]*)"/g, '$1');
     if (/\b(drop|delete|insert|update|alter|create|truncate|exec|execute)\b/i.test(outside)) return 'SQL contains a forbidden statement';
     if (!/\breviews\b/i.test(outside)) return 'SQL must read the reviews table';
+    if (/\b(?:read_\w+|sqlite_scan|postgres_scan|httpfs|glob|query|query_table)\s*\(|\b\w+\s*\.\s*reviews\b/i.test(outside)) return 'SQL must use the scoped reviews relation, not external readers or qualified tables';
     if (/projection_[xy]\s*\*/i.test(outside)) return 'Bin with the injected projection bounds, never projection_x * N';
     if (/floor\s*\(\s*projection_[xy]\s*\//i.test(outside)) return 'Bin with FLOOR((projection_x - min_x) / range_x * N), not projection_x / N';
     return null;
@@ -93,14 +94,14 @@ export function validateTopicSql(sql: string): string | null {
 
 export function prepareTopicSql(sql: string): string {
     let statement = stripLeadingComments(sql).trim().replace(/;\s*$/, '');
-    if (!aggregateOrStar(statement) && !/\b__row_index__\b/i.test(statement))
+    if (/^select\b/i.test(statement) && !aggregateOrStar(statement) && !/\b__row_index__\b/i.test(statement))
         statement = statement.replace(/^\s*select\s+/i, 'SELECT __row_index__, ');
     return `SELECT * FROM (${statement}) AS topic_sql LIMIT 1000`;
 }
 
 function aggregateOrStar(sql: string): boolean {
     const outside = stripStringsAndComments(sql);
-    return /\b(group\s+by|distinct|count\s*\(|avg\s*\(|sum\s*\(|min\s*\(|max\s*\(|date_trunc\s*\(|floor\s*\()\b/i.test(outside) || /\bselect\s+\*/i.test(outside);
+    return /\b(?:group\s+by|distinct)\b|\b(?:count|avg|sum|min|max|date_trunc|floor)\s*\(/i.test(outside) || /\bselect\s+\*/i.test(outside);
 }
 
 function stripLeadingComments(sql: string): string {
@@ -128,7 +129,14 @@ function stripStringsAndComments(sql: string): string {
         const pair = sql.slice(i, i + 2);
         if (pair === '--') { const end = sql.indexOf('\n', i); i = end < 0 ? sql.length : end; continue; }
         if (pair === '/*') { const end = sql.indexOf('*/', i + 2); i = end < 0 ? sql.length : end + 1; continue; }
-        if (sql[i] === "'") { const end = sql.indexOf("'", i + 1); i = end < 0 ? sql.length : end; output += ' '; continue; }
+        if (sql[i] === "'") {
+            for (i++; i < sql.length; i++) {
+                if (sql[i] !== "'") continue;
+                if (sql[i + 1] === "'") { i++; continue; }
+                break;
+            }
+            output += ' '; continue;
+        }
         output += sql[i];
     }
     return output;
@@ -169,11 +177,11 @@ export function selectSpreadIslands<T extends GridCell>(cells: T[], limit = MAP_
     return picked;
 }
 
-export function selectDiversifiedRows<T extends { id: string; gx: number; gy: number; lexical_score: number }>(rows: T[], limit: number): T[] {
-    const sorted = [...rows].sort((a, b) => b.lexical_score - a.lexical_score || a.id.localeCompare(b.id));
+export function selectDiversifiedRows<T extends { id: string | number; gx: number; gy: number; lexical_score: number }>(rows: T[], limit: number): T[] {
+    const sorted = [...rows].sort((a, b) => b.lexical_score - a.lexical_score || String(a.id).localeCompare(String(b.id)));
     const strongQuota = Math.min(limit, Math.max(6, Math.floor(limit * 0.4)));
     const chosen: T[] = [];
-    const used = new Set<string>();
+    const used = new Set<string | number>();
     for (const row of sorted) {
         if (chosen.length >= strongQuota) break;
         chosen.push(row);

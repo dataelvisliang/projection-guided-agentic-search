@@ -2,6 +2,7 @@ import { useState, useCallback, useRef } from 'react';
 import type { Coordinator } from '@uwdata/mosaic-core';
 
 import type { SearchPolicySnapshot } from '../agent/searchSession';
+import type { SearchContext } from '../agent/searchContract';
 import type { ToolResult } from '../tools/toolExecutor';
 
 export interface Message {
@@ -32,39 +33,15 @@ I search the wine map by region: I locate a topic on the map, check the reviews 
 Try asking: "Find me good value reds under $20" or "What are the common flavors in Tuscan wines?"`
 };
 
-function selectedReviewsContext(selectedPoints: any[], userMessage: string): string {
-    const totalSelected = (selectedPoints as any).totalCount || selectedPoints.length;
-    const maxContextChars = 100_000;
-    const reviews: string[] = [];
-    let totalChars = 0;
-    for (let index = 0; index < selectedPoints.length; index++) {
-        const point = selectedPoints[index];
-        const text = `[Review ${index + 1}] Points: ${point.fields?.points ?? point.fields?.Rating ?? 'N/A'} | Title: ${point.fields?.title ?? 'Unknown Wine'}\n${point.fields?.description ?? point.text ?? 'No description'}`;
-        if (totalChars + text.length > maxContextChars) break;
-        reviews.push(text);
-        totalChars += text.length;
-    }
-    const scores = selectedPoints.slice(0, reviews.length)
-        .map((point: any) => point.fields?.points ?? point.fields?.Rating)
-        .filter((score: unknown): score is number => typeof score === 'number');
-    const averageScore = scores.length ? (scores.reduce((sum, score) => sum + score, 0) / scores.length).toFixed(1) : 'N/A';
-    return `IMPORTANT: The user selected ${totalSelected} reviews on the visualization. Answer about this subset unless they explicitly ask to compare it with the full map.
-Selection sample: ${reviews.length}/${totalSelected}; average score: ${averageScore}.
-
-Selected reviews:
-${reviews.join('\n\n')}
-
-User question: ${userMessage}`;
-}
-
-function extractHighlightIds(toolResults: ToolResult[]): number[] {
+export function extractHighlightIds(toolResults: ToolResult[]): number[] {
     const ids = new Set<number>();
     for (const result of toolResults) {
-        for (const review of result.result?.reviews || result.result?.rows || []) if (typeof review.id === 'number') ids.add(review.id);
-        for (const id of result.result?.evidence_ids || result.result?.highlight_ids || []) if (typeof id === 'number') ids.add(id);
-        for (const region of result.result?.regions || []) {
-            for (const review of region.reviews || []) if (typeof review.id === 'number') ids.add(review.id);
-        }
+        if (result.error) continue;
+        const values = result.name === 'flexible_search'
+            ? result.result?.evidence_ids || []
+            : result.name === 'save_selection' ? result.result?.record_ids || []
+            : (result.result?.rows || []).filter((row: { match_type?: string }) => row.match_type !== 'cluster_neighbor').map((row: { id?: number; __row_index__?: number }) => row.id ?? row.__row_index__);
+        for (const id of values) if (Number.isSafeInteger(id)) ids.add(id);
     }
     return [...ids];
 }
@@ -73,7 +50,7 @@ function extractHighlightIds(toolResults: ToolResult[]): number[] {
  * The browser owns visual state only. The Agents SDK runtime owns model turns,
  * tool execution, policy enforcement, and the reproducible search trajectory.
  */
-export function useAgentChat(_coordinator: Coordinator | null) {
+export function useAgentChat(coordinator: Coordinator | null) {
     const [state, setState] = useState<AgentState>({
         messages: [INITIAL_MESSAGE],
         isLoading: false,
@@ -88,8 +65,10 @@ export function useAgentChat(_coordinator: Coordinator | null) {
     });
     const abortControllerRef = useRef<AbortController | null>(null);
     const inspectedRegionsCacheRef = useRef<any[]>([]);
+    const contextRef = useRef<SearchContext>({ probed_regions: [] });
 
     const applyRuntimeEffects = useCallback((toolResults: ToolResult[]) => {
+        inspectedRegionsCacheRef.current = [];
         for (const result of toolResults) {
             if (result.name === 'flexible_search' && result.result?.category) {
                 inspectedRegionsCacheRef.current.push({
@@ -111,7 +90,7 @@ export function useAgentChat(_coordinator: Coordinator | null) {
             if (result.name !== 'save_selection' || !result.result?.saved) continue;
             const { record_ids: recordIds, label } = result.result;
             const matchedRegions = inspectedRegionsCacheRef.current.filter(region =>
-                recordIds.some((id: number) => region.review_ids?.includes(id))
+                region.judgment_id === result.result.judgment_id && region.category === label
             );
             const matchedReviews = matchedRegions.flatMap(region =>
                 (region.reviews || []).filter((review: any) => recordIds.includes(review.id))
@@ -144,12 +123,12 @@ export function useAgentChat(_coordinator: Coordinator | null) {
             }));
         }
         const highlightIds = extractHighlightIds(toolResults);
-        if (highlightIds.length) setState(previous => ({ ...previous, highlightIds }));
+        setState(previous => ({ ...previous, highlightIds: highlightIds.length ? highlightIds : null }));
     }, []);
 
     const sendMessage = useCallback(async (userMessage: string, selectedPoints?: any[], _selectionPredicate?: string | null) => {
         if (!userMessage.trim() || state.isLoading) return;
-        const userMessageForAgent = selectedPoints?.length ? selectedReviewsContext(selectedPoints, userMessage) : userMessage;
+
         const userMsg: Message = { role: 'user', content: userMessage };
         setState(previous => ({
             ...previous,
@@ -162,14 +141,25 @@ export function useAgentChat(_coordinator: Coordinator | null) {
 
         abortControllerRef.current = new AbortController();
         try {
+            let selectionIds: number[] | undefined;
+            if (_selectionPredicate) {
+                if (!coordinator) throw new Error('The selected map is not ready.');
+                const rows = (await coordinator.query(`SELECT __row_index__ AS id FROM reviews WHERE ${_selectionPredicate}`)).toArray();
+                selectionIds = rows.map(row => Number(row.id));
+            } else if (selectedPoints?.length) {
+                const total = Number((selectedPoints as any).totalCount || selectedPoints.length);
+                if (total > selectedPoints.length) throw new Error('The full selection is unavailable. Select the region again.');
+                selectionIds = selectedPoints.map(point => Number(point.identifier));
+            }
+            const context = { ...contextRef.current, selection_ids: selectionIds };
             const messages = state.messages
                 .filter(message => message.role === 'user' || message.role === 'assistant')
                 .map(message => ({ role: message.role, content: message.content }));
-            messages.push({ role: 'user', content: userMessageForAgent });
+            messages.push({ role: 'user', content: userMessage });
             const response = await fetch('/api/agent', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ messages }),
+                body: JSON.stringify({ messages, context }),
                 signal: abortControllerRef.current.signal
             });
             const data = await response.json().catch(() => ({}));
@@ -177,6 +167,7 @@ export function useAgentChat(_coordinator: Coordinator | null) {
             if (data.type !== 'runtime_response') throw new Error('Agent runtime returned an unsupported response');
 
             const toolResults = Array.isArray(data.tool_results) ? data.tool_results as ToolResult[] : [];
+            if (data.search_context) contextRef.current = data.search_context;
             applyRuntimeEffects(toolResults);
             const assistantMsg: Message = {
                 role: 'assistant',
@@ -206,7 +197,7 @@ export function useAgentChat(_coordinator: Coordinator | null) {
         } finally {
             abortControllerRef.current = null;
         }
-    }, [applyRuntimeEffects, state.isLoading, state.messages]);
+    }, [applyRuntimeEffects, state.isLoading, state.messages, coordinator]);
 
     const clearChat = useCallback(() => {
         setState({
@@ -214,6 +205,7 @@ export function useAgentChat(_coordinator: Coordinator | null) {
             toolsExecuted: [], highlightIds: null, savedCategories: new Map(), inspectedRegionsCache: [], searchPolicy: null
         });
         inspectedRegionsCacheRef.current = [];
+        contextRef.current = { probed_regions: [] };
     }, []);
 
     const clearHighlight = useCallback(() => setState(previous => ({ ...previous, highlightIds: null })), []);

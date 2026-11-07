@@ -253,6 +253,16 @@ function App() {
       default: return <Database size={12} />;
     }
   };
+  const toolLabels: Record<string, string> = {
+    load_workflow_playbook: 'Choosing an approach',
+    report_progress: 'Progress update',
+    sql_query: 'Checking the data',
+    map_search: 'Finding examples',
+    flexible_search: 'Reviewing evidence',
+    transition_ring: 'Adjusting the search',
+    complete_answer: 'Preparing the answer',
+    save_selection: 'Saving examples'
+  };
 
   return (
     <div className="app-container">
@@ -515,14 +525,14 @@ function App() {
                       {toolsExecuted.map((tool, i) => (
                         <span key={i} className="tool-badge executing">
                           {getToolIcon(tool)}
-                          {tool.replace('_', ' ')}
+                          {toolLabels[tool] || 'Checking evidence'}
                         </span>
                       ))}
                     </div>
                   )}
                   {searchPolicy && (
                     <div className="step-indicator" style={{ marginTop: '6px' }}>
-                      Policy: {searchPolicy.inspected_region_count} probes | {searchPolicy.accepted_region_count}/{searchPolicy.objective.target_accepted_regions} accepted | {searchPolicy.relevant_themes.length} relevant themes | {searchPolicy.frontier.length} frontier | {searchPolicy.remaining.toolCalls} actions | {searchPolicy.remaining.modelTokens.toLocaleString()} tokens left | {(searchPolicy.elapsed_ms / 1000).toFixed(1)}s
+                      Evidence: {searchPolicy.inspected_region_count} regions checked | {searchPolicy.accepted_region_count} accepted | {searchPolicy.relevant_themes.length} themes | {searchPolicy.frontier.length} areas unexplored | {searchPolicy.remaining.toolCalls} steps left | {(searchPolicy.elapsed_ms / 1000).toFixed(1)}s
                       {searchPolicy.must_stop && ` | stopping: ${searchPolicy.stop_reason}`}
                     </div>
                   )}

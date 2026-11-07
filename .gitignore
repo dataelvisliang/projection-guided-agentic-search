@@ -16,6 +16,9 @@ Thumbs.db
 # Claude
 .claude/
 
+# Local search notes
+/SEARCH_CONTRACT.md
+
 # Node (if any experiments)
 node_modules/
 

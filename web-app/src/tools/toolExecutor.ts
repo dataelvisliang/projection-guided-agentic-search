@@ -108,13 +108,16 @@ export class ToolExecutor {
         const chosen = [...direct.slice(0, ANALYZER_MAX_ROWS - neighborCount), ...eligibleNeighbors.slice(0, neighborCount)];
         const analyzerRows = chosen.map(row => ({
             id: row.id, points: row.points, price: row.price, country: row.country, variety: row.variety, title: row.title,
-            evidence_type: row.match_type === 'cluster_neighbor' ? 'projection_neighbor_context' : 'direct_lexical_match',
+            evidence_type: row.match_type === 'cluster_neighbor' ? 'projection_neighbor_context' : plan.directPhrases.length ? 'direct_lexical_match' : 'scope_sample',
             text: String(row.description || '').slice(0, 3500)
         }));
         const analysis = await this.analyze(args.prompt || args.query || 'Topic sample', analyzerRows, region);
-        const evidence_ids = direct.slice(0, ANALYZER_MAX_ROWS - neighborCount).map(row => row.id);
+        const directIds = new Set(direct.slice(0, ANALYZER_MAX_ROWS - neighborCount).map(row => row.id));
+        const evidence_ids = analysis.representative_evidence_ids.filter((id: number) => directIds.has(id));
+        const diagnostics = await this.coverage(boundsOf(args.bounds), region, plan.directPhrases.length ? plan : null, chosen, args.match_mode === 'AND' ? 'AND' : 'OR');
         return { name: 'flexible_search', call_id: callId, result: {
-            ...retrieval, ...analysis, evidence_ids, highlight_ids: evidence_ids, region: region || null,
+            ...retrieval, ...analysis, ...diagnostics, sample_count: chosen.length,
+            evidence_ids, highlight_ids: evidence_ids, region: region || null,
             rows: chosen.map(row => ({ id: row.id, excerpt: String(row.description || '').slice(0, 300) }))
         } };
     }
@@ -126,6 +129,7 @@ export class ToolExecutor {
         const region = args.region as Region | undefined;
         const hasTerms = plan.directPhrases.length + plan.directTokens.length + plan.expandedTerms.length > 0;
         const strategy = args.search_strategy || (hasTerms ? 'ranked' : 'recall');
+        const matchMode = args.match_mode === 'AND' ? 'AND' : 'OR';
         let rows: ReviewRow[] = [];
         let method = 'ranked';
         let recall_passes: string[] = [];
@@ -138,14 +142,16 @@ export class ToolExecutor {
             recall_passes = fused.passes;
             rows = diversify(fused.rows, limit, bounds);
         } else {
-            rows = diversify(await this.ranked(plan, region, Math.max(limit, 180)), limit, bounds);
+            rows = diversify(await this.ranked(plan, region, Math.max(limit, 180), matchMode), limit, bounds);
         }
-        const expanded_rows = args.expand_clusters ? await this.expand(rows) : [];
+        const expanded_rows = args.expand_clusters ? await this.expand(rows, region) : [];
         const seed_islands = hasTerms ? await this.islands(plan, bounds, region, args.match_mode === 'AND' ? 'AND' : 'OR') : [];
-        const coverage_warning = await this.coverage(bounds, region, hasTerms ? plan : null, rows);
-        const matchRows = await this.countMatches(plan, region, hasTerms);
+        const diagnostics = await this.coverage(bounds, region, hasTerms ? plan : null, rows, matchMode);
+        const matchRows = await this.countMatches(plan, region, hasTerms, matchMode);
+        const scopeRows = await this.query(`SELECT COUNT(*) AS scope_count FROM reviews WHERE ${scopeSql(region)}`);
         return {
-            method, warnings: plan.warnings, recall_passes, rows, expanded_rows, seed_islands, coverage_warning,
+            method, warnings: plan.warnings, recall_passes, rows, expanded_rows, seed_islands, ...diagnostics,
+            scope_count: Number(scopeRows[0]?.scope_count || 0), sample_count: rows.length,
             lexical_match_count: matchRows, region: region || null,
             region_contract: {
                 region_role: 'candidate_navigation_region', region_coherence_status: 'unvalidated',
@@ -154,12 +160,12 @@ export class ToolExecutor {
         };
     }
 
-    private async ranked(plan: SearchPlan, region: Region | undefined, limit: number): Promise<ReviewRow[]> {
+    private async ranked(plan: SearchPlan, region: Region | undefined, limit: number, matchMode: 'AND' | 'OR'): Promise<ReviewRow[]> {
         const score = scoreSql(plan);
         const rows = await this.query(`
             SELECT ${COLUMNS}, ${score.lexical} AS lexical_score, ${score.matched} AS matched_term_count, ${score.phrases} AS phrase_score
             FROM reviews
-            WHERE ${scopeSql(region)} AND (${matchSql(plan, 'OR')})
+            WHERE ${scopeSql(region)} AND (${matchSql(plan, matchMode)})
             ORDER BY lexical_score DESC, matched_term_count DESC, phrase_score DESC, __row_index__ ASC
             LIMIT ${limit}
         `);
@@ -176,7 +182,7 @@ export class ToolExecutor {
         const fused = fuseRanks(passes);
         if (!fused.length) return { rows: [] as ReviewRow[], passes: passes.map(pass => pass.name) };
         const ids = fused.map(row => Number(row.id)).filter(Number.isInteger);
-        const fetched = await this.query(`SELECT ${COLUMNS} FROM reviews WHERE __row_index__ IN (${ids.join(',')})`);
+        const fetched = await this.query(`SELECT ${COLUMNS} FROM reviews WHERE ${scopeSql(region)} AND (${matchSql(plan, matchMode)}) AND __row_index__ IN (${ids.join(',')})`);
         const byId = new Map(fetched.map(row => [Number(row.__row_index__), row]));
         const rows = fused.flatMap(item => {
             const row = byId.get(Number(item.id));
@@ -207,6 +213,7 @@ export class ToolExecutor {
                 ) AS rn
                 FROM reviews WHERE ${scopeSql(region)}
             ) sampled WHERE rn <= ${MAP_SEARCH_STRATIFIED_PER_CELL}
+            ORDER BY rn, hash(FLOOR((projection_x - ${bounds.min_x}) / ${rangeX} * 48), FLOOR((projection_y - ${bounds.min_y}) / ${rangeY} * 48)), __row_index__
             LIMIT 360
         `);
         return diversify(rows.map(row => toReview({ ...row, lexical_score: 0 }, 'direct')), limit, bounds);
@@ -240,16 +247,18 @@ export class ToolExecutor {
         }));
     }
 
-    private async expand(seeds: ReviewRow[]): Promise<ReviewRow[]> {
+    private async expand(seeds: ReviewRow[], region?: Region): Promise<ReviewRow[]> {
         const anchors = seeds.filter(row => Number.isFinite(row.projection_x)).slice(0, 12);
         if (!anchors.length) return [];
         const radius = Math.min(MAP_SEARCH_PROJECTION_RADIUS, MAP_SEARCH_PROJECTION_RADIUS_CAP);
         const ids = [...new Set(seeds.map(row => row.id))].join(',');
         const near = anchors.map(row => `(projection_x - ${row.projection_x}) * (projection_x - ${row.projection_x}) + (projection_y - ${row.projection_y}) * (projection_y - ${row.projection_y}) <= ${radius * radius}`).join(' OR ');
+        const distanceSql = `LEAST(${anchors.map(row => `(projection_x - ${row.projection_x}) * (projection_x - ${row.projection_x}) + (projection_y - ${row.projection_y}) * (projection_y - ${row.projection_y})`).join(',')})`;
         const rows = await this.query(`
-            SELECT ${COLUMNS} FROM reviews
-            WHERE __row_index__ NOT IN (${ids || 'NULL'}) AND (${near})
-            LIMIT 200
+            SELECT ${COLUMNS}, ${distanceSql} AS projection_distance FROM reviews
+            WHERE ${scopeSql(region)} AND __row_index__ NOT IN (${ids || 'NULL'}) AND (${near})
+            ORDER BY projection_distance ASC, __row_index__ ASC
+            LIMIT 25
         `);
         return rows.map(row => {
             const distance = Math.min(...anchors.map(seed => Math.hypot(Number(row.projection_x) - seed.projection_x, Number(row.projection_y) - seed.projection_y)));
@@ -257,16 +266,19 @@ export class ToolExecutor {
         }).sort((a, b) => a.distance - b.distance).slice(0, 25);
     }
 
-    private async coverage(bounds: Bounds, region: Region | undefined, plan: SearchPlan | null, rows: ReviewRow[]) {
+    private async coverage(bounds: Bounds, region: Region | undefined, plan: SearchPlan | null, rows: ReviewRow[], mode: 'AND' | 'OR') {
         const scopeCells = await this.cellCount(bounds, region, null);
-        const directCells = plan ? await this.cellCount(bounds, region, plan) : 0;
-        const analyzedCells = new Set(rows.map(row => `${gridIndex(row.projection_x, bounds.min_x, bounds.max_x - bounds.min_x)}:${gridIndex(row.projection_y, bounds.min_y, bounds.max_y - bounds.min_y)}`)).size;
-        return evaluateCoverageWarning(scopeCells, directCells, analyzedCells, rows.length);
+        const directCells = plan ? await this.cellCount(bounds, region, plan, mode) : scopeCells;
+        const keys = [...new Set(rows.map(row => `${gridIndex(row.projection_x, bounds.min_x, bounds.max_x - bounds.min_x)}:${gridIndex(row.projection_y, bounds.min_y, bounds.max_y - bounds.min_y)}`))];
+        return {
+            coverage_warning: evaluateCoverageWarning(scopeCells, directCells, keys.length, rows.length),
+            projection_coverage: { scope_cells: scopeCells, direct_match_cells: directCells, analyzed_cells: keys.length, analyzed_rows: rows.length, returned_cell_keys: keys }
+        };
     }
 
-    private async cellCount(bounds: Bounds, region: Region | undefined, plan: SearchPlan | null): Promise<number> {
+    private async cellCount(bounds: Bounds, region: Region | undefined, plan: SearchPlan | null, mode: 'AND' | 'OR' = 'OR'): Promise<number> {
         const { rangeX, rangeY } = ranges(bounds);
-        const match = plan ? ` AND (${matchSql(plan, 'OR')})` : '';
+        const match = plan ? ` AND (${matchSql(plan, mode)})` : '';
         const rows = await this.query(`
             SELECT COUNT(*) AS cells FROM (
                 SELECT 1 FROM reviews
@@ -277,9 +289,9 @@ export class ToolExecutor {
         return Number(rows[0]?.cells || 0);
     }
 
-    private async countMatches(plan: SearchPlan, region: Region | undefined, hasTerms: boolean): Promise<number> {
+    private async countMatches(plan: SearchPlan, region: Region | undefined, hasTerms: boolean, mode: 'AND' | 'OR'): Promise<number> {
         if (!hasTerms) return 0;
-        const rows = await this.query(`SELECT COUNT(*) AS matches FROM reviews WHERE ${scopeSql(region)} AND (${matchSql(plan, 'OR')})`);
+        const rows = await this.query(`SELECT COUNT(*) AS matches FROM reviews WHERE ${scopeSql(region)} AND (${matchSql(plan, mode)})`);
         return Number(rows[0]?.matches || 0);
     }
 
@@ -307,6 +319,7 @@ export class ToolExecutor {
                     representative_evidence_ids: Array.isArray(body.representative_evidence_ids) ? body.representative_evidence_ids : [],
                     metadata_insights: body.metadata_insights && typeof body.metadata_insights === 'object' ? body.metadata_insights : {},
                     fallback: Boolean(body.fallback),
+                    coherence: ['coherent', 'mixed', 'low'].includes(body.coherence) ? body.coherence : 'unknown',
                     analyzer_usage: body.analyzer_usage
                 };
             } catch (error) { failure = error; }
@@ -316,7 +329,7 @@ export class ToolExecutor {
         return {
             category: themes.slice(0, 3).join(' ') || 'Unlabeled sample', themes, summary: 'Analyzer fallback from sampled wording.',
             intent_fit: 0.5, intent_fit_label: 'low' as const, off_intent_signals: [], refinement_suggestion: 'Retry the judge.',
-            representative_evidence_ids: [], metadata_insights: {}, fallback: true,
+            representative_evidence_ids: [], metadata_insights: {}, fallback: true, coherence: 'unknown',
             analyzer_status: failure instanceof Error ? failure.message : 'analyzer_failed'
         };
     }
@@ -368,11 +381,12 @@ function like(term: string): string {
 }
 
 function matchSql(plan: SearchPlan, mode: 'AND' | 'OR'): string {
+    if (mode === 'AND') return plan.directPhrases.map(like).join(' AND ') || 'TRUE';
     const phrases = plan.directPhrases.map(like);
     const tokens = plan.directTokens.map(like);
     const variants = plan.expandedTerms.map(like);
     const parts = [...phrases, ...tokens, ...variants];
-    return parts.length ? parts.join(mode === 'AND' ? ' AND ' : ' OR ') : 'TRUE';
+    return parts.length ? parts.join(' OR ') : 'TRUE';
 }
 
 function scoreSql(plan: SearchPlan) {

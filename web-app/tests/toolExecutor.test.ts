@@ -6,10 +6,11 @@ class FixtureCoordinator {
     async query(sql: string) {
         this.sql.push(sql);
         const review = { __row_index__: 42, description: 'pepper and beef', title: 'Fixture', points: 90, price: 20, variety: 'Syrah', country: 'France', projection_x: 1, projection_y: 1 };
-        if (sql.includes('AS lexical_score') || sql.includes('WHERE __row_index__ IN')) return { toArray: () => [review] };
+        if (sql.includes('AS lexical_score') || sql.includes('__row_index__ IN')) return { toArray: () => [review] };
         if (sql.includes('__row_index__ AS id')) return { toArray: () => [{ id: 42 }] };
         if (sql.includes('GROUP BY gx')) return { toArray: () => [{ gx: 1, gy: 2, support: 4, min_x: 0.2, max_x: 0.8, min_y: 0.2, max_y: 0.8, sample_id: 42 }] };
         if (sql.includes('AS cells')) return { toArray: () => [{ cells: 20 }] };
+        if (sql.includes('AS scope_count')) return { toArray: () => [{ scope_count: 12 }] };
         if (sql.includes('AS matches')) return { toArray: () => [{ matches: 1 }] };
         if (sql.includes('topic_sql')) return { toArray: () => [{ cnt: 8, min_x: 0, max_x: 1, min_y: 0, max_y: 1 }] };
         return { toArray: () => [] };
@@ -27,7 +28,7 @@ assert.match(coordinator.sql.at(-1) || '', /LIMIT 1000/);
 
 const originalFetch = globalThis.fetch;
 globalThis.fetch = async () => new Response(JSON.stringify({
-    category: 'Pepper Syrah', themes: ['pepper'], summary: 'Pepper in the sample.', intent_fit: 0.91,
+    coherence: 'coherent', category: 'Pepper Syrah', themes: ['pepper'], summary: 'Pepper in the sample.', intent_fit: 0.91,
     intent_fit_label: 'high', off_intent_signals: [], refinement_suggestion: '', representative_evidence_ids: [42], metadata_insights: {}
 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 try {

@@ -8,13 +8,14 @@ const ANALYZER_JSON_SCHEMA = {
     strict: true,
     schema: {
         type: 'object', additionalProperties: false,
-        required: ['category', 'themes', 'summary', 'intent_fit', 'intent_fit_label', 'off_intent_signals', 'refinement_suggestion', 'representative_evidence_ids', 'metadata_insights'],
+        required: ['category', 'themes', 'summary', 'intent_fit', 'intent_fit_label', 'off_intent_signals', 'refinement_suggestion', 'representative_evidence_ids', 'metadata_insights', 'coherence'],
         properties: {
             category: { type: 'string' },
             themes: { type: 'array', items: { type: 'string' }, maxItems: 5 },
             summary: { type: 'string' },
             intent_fit: { type: 'number', minimum: 0, maximum: 1 },
             intent_fit_label: { type: 'string', enum: ['high', 'medium', 'low'] },
+            coherence: { type: 'string', enum: ['coherent', 'mixed', 'low'] },
             off_intent_signals: { type: 'array', items: { type: 'string' } },
             refinement_suggestion: { type: 'string' },
             representative_evidence_ids: { type: 'array', items: { type: 'integer' } },
@@ -25,7 +26,7 @@ const ANALYZER_JSON_SCHEMA = {
 
 const ANALYZER_SYSTEM_PROMPT = `You judge one map ring of wine reviews against the user's topic.
 Return only JSON with category (2-4 words), themes (2-5), summary (1-2 sentences, no prevalence claims beyond this sample), intent_fit from 0 to 1, intent_fit_label (high at least 0.8, medium from 0.55, otherwise low), off_intent_signals, refinement_suggestion, representative_evidence_ids chosen only from the supplied ids, and metadata_insights.
-Score the supplied review text only. Coordinates and density are not evidence. A mixed ring gets a lower intent_fit rather than a blended category that hides the mix.`;
+Score the supplied review text only. Coordinates and density are not evidence. Return coherence as coherent, mixed, or low based on consistency of the sampled content. Coherence and relevance are separate: a coherent region can be off intent. A mixed ring gets a lower intent_fit rather than a blended category that hides the mix. representative_evidence_ids must include only directly relevant direct_lexical_match or scope_sample ids; projection_neighbor_context ids are context only. If no direct sample supports the intent, return an empty id list and low fit.`;
 
 export function intentFitLabel(value: number): 'high' | 'medium' | 'low' {
     return classifyIntentFit(clampIntentFit(value));
@@ -35,7 +36,7 @@ function parseAnalysis(content: string, allowedIds: Set<number>) {
     try {
         const jsonMatch = content.match(/```json\n([\s\S]+?)\n```/) || content.match(/\{[\s\S]+\}/);
         const parsed = JSON.parse(jsonMatch ? (jsonMatch[1] || jsonMatch[0]) : content);
-        if (!parsed || typeof parsed.category !== 'string' || !parsed.category.trim()) return null;
+        if (!parsed || typeof parsed.category !== 'string' || !parsed.category.trim() || typeof parsed.intent_fit !== 'number' || !Number.isFinite(parsed.intent_fit)) return null;
         const intent_fit = clampIntentFit(parsed.intent_fit);
         const ids = Array.isArray(parsed.representative_evidence_ids) ? parsed.representative_evidence_ids.map(Number).filter((id: number) => allowedIds.has(id)) : [];
         return {
@@ -48,7 +49,8 @@ function parseAnalysis(content: string, allowedIds: Set<number>) {
             refinement_suggestion: String(parsed.refinement_suggestion || ''),
             representative_evidence_ids: ids,
             metadata_insights: parsed.metadata_insights && typeof parsed.metadata_insights === 'object' ? parsed.metadata_insights : {},
-            fallback: false
+            fallback: false,
+            coherence: ['coherent', 'mixed', 'low'].includes(parsed.coherence) ? parsed.coherence : 'unknown'
         };
     } catch { return null; }
 }
@@ -62,7 +64,7 @@ function fallbackAnalysis(reviews: Array<{ text?: string }>) {
         category: themes.slice(0, 3).join(' ') || 'Unlabeled sample',
         themes, summary: 'Analyzer fallback from sampled wording.', intent_fit: 0.5, intent_fit_label: 'low' as const,
         off_intent_signals: [], refinement_suggestion: 'Retry the judge.', representative_evidence_ids: [],
-        metadata_insights: {}, fallback: true
+        metadata_insights: {}, fallback: true, coherence: 'unknown'
     };
 }
 
@@ -73,7 +75,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (req.method === 'OPTIONS') return res.status(200).end();
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
     const apiKey = process.env.OPENROUTER_API_KEY;
-    const model = process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash';
+    const model = process.env.OPENROUTER_ANALYZER_MODEL || process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5';
     if (!apiKey) return res.status(500).json({ error: 'OpenRouter API key not configured' });
 
     const { region, reviews, prompt, intent } = req.body || {};
@@ -104,7 +106,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                     ],
                     temperature: 0, max_tokens: 900,
                     response_format: { type: 'json_schema', json_schema: ANALYZER_JSON_SCHEMA },
-                    reasoning: { effort: 'low', exclude: true },
+                    reasoning: { enabled: false },
                     plugins: [{ id: 'response-healing' }]
                 })
             });
@@ -114,12 +116,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
 
     let parsed = null;
-    let usage = null;
+    const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
         if (attempt) await new Promise(resolve => setTimeout(resolve, 1000));
         try {
             const data = await callModel();
-            usage = data.usage;
+            usage.prompt_tokens += Number(data.usage?.prompt_tokens) || 0;
+            usage.completion_tokens += Number(data.usage?.completion_tokens) || 0;
+            usage.total_tokens += Number(data.usage?.total_tokens) || 0;
             const message = data.choices?.[0]?.message;
             const content = message?.content || (message?.reasoning_details || []).map((detail: { content?: string }) => detail.content).join('\n');
             parsed = parseAnalysis(String(content || ''), allowedIds);

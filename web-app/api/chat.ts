@@ -23,7 +23,7 @@ export default async function handler(
 
   // Get API key from environment (secure, server-side only)
   const apiKey = process.env.OPENROUTER_API_KEY;
-  const defaultModel = process.env.OPENROUTER_MODEL || 'z-ai/glm-5.3-flash';
+  const defaultModel = process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-5.5';
 
   if (!apiKey) {
     return res.status(500).json({ error: 'OpenRouter API key not configured' });

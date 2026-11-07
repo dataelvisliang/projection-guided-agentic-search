@@ -1,0 +1,24 @@
+{
+  "system_id": "topic_ring_probe_v2",
+  "contract_version": "topic-ring-probe-v2",
+  "dataset": "reviews",
+  "agent_runtime": "@openai/agents",
+  "agent_model": "anthropic/claude-haiku-5.5",
+  "analyzer_model": "anthropic/claude-haiku-5.5",
+  "runtime_embeddings": false,
+  "search_region": "rectangle",
+  "tools": ["load_workflow_playbook", "report_progress", "sql_query", "map_search", "flexible_search", "transition_ring", "complete_answer"],
+  "presentation_event": "save_selection",
+  "execution": "serialized_state_validation",
+  "limits": {
+    "actions": 35,
+    "sql_per_turn_before_first_judge": 2,
+    "refinements_after_viable_evidence": 3,
+    "consecutive_non_improving": 2,
+    "dimension_sql": 4,
+    "dimension_flexible": 2,
+    "reported_tokens": 80000,
+    "elapsed_ms": 120000
+  },
+  "validation": "deterministic_contract_tests; live quality evaluation is separate"
+}

@@ -18,7 +18,7 @@ except (KeyError, FileNotFoundError):
     import os
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
-def chat_with_openrouter(messages, model="nvidia/nemotron-3-nano-30b-a3b:free"):
+def chat_with_openrouter(messages, model="anthropic/claude-haiku-5.5"):
     """Send chat request to OpenRouter API"""
     
     if not OPENROUTER_API_KEY:
@@ -64,10 +64,7 @@ with st.sidebar:
     chat_model = st.selectbox(
         "Model",
         [
-            "nvidia/nemotron-3-nano-30b-a3b:free",
-            "xiaomi/mimo-v2-flash:free",
-            "z-ai/glm-4.5-air:free",
-            "deepseek/deepseek-r1-0528:free"
+            "anthropic/claude-haiku-5.5"
         ],
         help="Select AI model for chat"
     )

@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.api.tsbuildinfo",
+    "lib": ["ES2023", "DOM"]
+  },
+  "include": ["api", "tests", "../benchmark/scripts/run_sdk_par_pilot.ts"]
+}
