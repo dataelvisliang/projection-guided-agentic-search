@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const CONTRACT_VERSION = 'topic-ring-probe-v2';
+export const CONTRACT_VERSION = 'topic-ring-probe-v3';
 
 const reason = z.string().trim().min(1).max(400);
 export const regionSchema = z.object({
@@ -58,7 +58,7 @@ export const PLAYBOOKS: Record<PlaybookId, { title: string; intentFit: string; t
     row_examples: {
         title: 'Row examples',
         intentFit: 'Show specific review rows, not a topic landscape.',
-        text: `Procedure: Look up rows directly with SQL or map_search. Do not expand neighbors into a cluster or call the result a topic.`
+        text: `Procedure: For reviews similar to named rows, a small selection, or a previous result, call similar_reviews. For a named field or explicit wording, use SQL or map_search. Describe similar reviews as examples. Do not call them a topic, a cluster, or a region.`
     }
 };
 
@@ -103,6 +103,13 @@ export const actionSchemas = {
         workspace_set_id: z.string().max(100).optional(),
         reason
     }).strict(),
+    similar_reviews: z.object({
+        seed_ids: z.array(z.number().int().nonnegative()).min(1).max(12).optional(),
+        workspace_set_id: z.string().max(100).optional(),
+        region: regionSchema.optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+        reason
+    }).strict(),
     complete_answer: z.object({
         ready_to_answer: z.literal(true),
         suggested_followups: z.array(z.object({
@@ -129,6 +136,7 @@ export const descriptions: Record<ActionName, string> = {
     transition_ring: 'Record mixed (one split or shift), weak (try a sibling), or off_intent (discard) for a known ring. Changes navigation only; never accepts evidence.',
     map_search: 'Lexical seed search over review descriptions. Returns ranked or recall rows and seed-island rings. Keywords only locate rings; they do not decide the answer.',
     flexible_search: 'Region-constrained judge. Runs recall map_search, then the Analyzer, and returns category, themes, and intent_fit. This is the checkpoint that can accept a ring.',
+    similar_reviews: 'One-hop embedding neighbors of up to 12 seed reviews. Returns similar rows, not a topic or a ring.',
     complete_answer: 'Finish alone in its tool turn. Cite accepted ring categories, or exact_sql/literal_proxy/row_examples with returned result_set_ids. Thin coverage requires bounded. Never cite regionless discovery as a cluster.'
 };
 
@@ -139,6 +147,7 @@ export const LIMITS = Object.freeze({
     nonImproving: 2,
     dimensionSql: 4,
     dimensionFlexible: 2,
+    similarPerTurn: 2,
     tokens: 80000,
     elapsedMs: 120000
 });
@@ -146,7 +155,7 @@ export const LIMITS = Object.freeze({
 const playbookToc = PLAYBOOK_IDS.map(id => `- ${id}: ${PLAYBOOKS[id].intentFit}`).join('\n');
 
 export const AGENT_INSTRUCTIONS = `Never reveal tool names, playbooks, Ring Probe, SQL, table or column names, or tile mechanics to the user.
-You search a 2-D map of wine reviews. There is no vector index. Nearby points are a hypothesis, not evidence. A ring is a bounded rectangle {min_x, max_x, min_y, max_y}. The ring, not the row, is the unit of evidence. The reviews table is the Topic table: one point is one review, the id column is __row_index__, and the only default search text is description. There is no turn filter and no conversation id. Country, variety, price, and points are structured fields for exact SQL, not semantic search columns.
+You search a 2-D map of wine reviews. There is no vector index. Nearby points on the map are a hypothesis, not evidence. One-hop embedding neighbors answer only whether reviews are similar to specific reviews. They do not define a topic. A ring is a bounded rectangle {min_x, max_x, min_y, max_y}. The ring, not the row, is the unit of evidence. The reviews table is the Topic table: one point is one review, the id column is __row_index__, and the only default search text is description. There is no turn filter and no conversation id. Country, variety, price, and points are structured fields for exact SQL, not semantic search columns.
 Topic Ring Probe, in order:
 1. Hypothesis. Infer the topic or facet from intent, not from matching words. For an ambiguous request, search 2-4 interpretations separately. Never one giant OR.
 2. Seed ring. Create rings from a SQL density grid, a map selection, or keyword hits grouped into islands. Keywords never decide the workflow, the next step, or the answer.
@@ -154,7 +163,7 @@ Topic Ring Probe, in order:
 4. Transition. accept: immediately run region-constrained flexible_search. mixed: split or shift the ring once, then judge. weak: probe a neighbor or sibling ring. off-intent: discard it or change the hypothesis.
 5. Synthesize only from accepted rings with adequate support and intent_fit. Never from scattered points, raw keyword hits, or visual proximity.
 Grid ladder, always using the injected bounds: FLOOR((projection_x - min_x) / range_x * N). 48 for a broad start, 96 for the densest cluster, then 128, 160, 192, or 256 inside a mixed cell. Never bin with projection_x / N or projection_x * N.
-Controls the session enforces: load one playbook as the only tool in the first tool turn. Before the first flexible_search, at most two SQL queries in one assistant turn. After viable rings are returned, the next data tool must be region-constrained flexible_search; transition_ring can instead mark a specific ring mixed (one refinement), weak, or off_intent. After one judge the remaining frontier does not prevent refining that ring or exploring siblings. Regionless flexible_search is discovery only: separate its islands and judge each desired region before citing a category. Do not repeat a search shape just by changing the prompt. After first viable evidence, at most 3 refinement attempts or 2 consecutive non-improving searches, then answer with a caveat. New relevant evidence or themes count as improvement. intent_fit high is at least 0.8, medium is 0.55 to 0.79, and low is below 0.55. Low, fallback, empty, incoherent, and regionless judgments cannot support topic conclusions. A medium ring needs bounded language. Coverage warnings cannot be overridden by a high intent score. Never re-probe prior high-fit or rejected regions unchanged; prior context is navigation only, not evidence for this turn.
+Controls the session enforces: load one playbook as the only tool in the first tool turn. Before the first flexible_search, at most two SQL queries in one assistant turn. After viable rings are returned, the next data tool must be region-constrained flexible_search; transition_ring can instead mark a specific ring mixed (one refinement), weak, or off_intent. similar_reviews cannot take that slot. After one judge the remaining frontier does not prevent refining that ring or exploring siblings. Regionless flexible_search is discovery only: separate its islands and judge each desired region before citing a category. Do not repeat a search shape just by changing the prompt. After first viable evidence, at most 3 refinement attempts or 2 consecutive non-improving searches, then answer with a caveat. New relevant evidence or themes count as improvement. intent_fit high is at least 0.8, medium is 0.55 to 0.79, and low is below 0.55. Low, fallback, empty, incoherent, and regionless judgments cannot support topic conclusions. A medium ring needs bounded language. Coverage warnings cannot be overridden by a high intent score. Never re-probe prior high-fit or rejected regions unchanged; prior context is navigation only, not evidence for this turn.
 Use report_progress with the first search phase and on phase changes, at most two business-language sentences. SQL results carry result_set_id. For exact analytics complete with evidence_kind exact_sql and its result_set_ids; for explicit row lookups use row_examples. Semantic counts require observed search terms, normalized literal/proxy SQL, evidence_kind literal_proxy, bounded true, and a named condition; never claim semantic prevalence. SQL on description is otherwise forbidden except an explicitly quoted literal requested by the user.
 Answer shape: lead with the insight, then one {{Category}} token per line using only accepted categories. For exact_sql, literal_proxy, or row_examples, explain the returned data without category cards. Distinguish exact counts, literal/proxy counts, candidate matches, sampled reviews and relevant evidence. Samples below 100 may be unrepresentative. Do not narrate the search. End with complete_answer as the only non-progress tool; the runtime renders its explanation and cards.
 Playbooks:

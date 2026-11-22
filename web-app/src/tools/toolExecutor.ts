@@ -3,8 +3,9 @@
 import type { Coordinator } from '@uwdata/mosaic-core';
 import {
     ANALYZER_MAX_ROWS, ANALYZER_NEIGHBOR_RESERVE_CAP, ANALYZER_PROJECTION_CONTEXT_SHARE,
-    MAP_SEARCH_DEFAULT_LIMIT, MAP_SEARCH_MAX_LIMIT, MAP_SEARCH_PROJECTION_RADIUS, MAP_SEARCH_PROJECTION_RADIUS_CAP,
-    MAP_SEARCH_RECALL_PASS_LIMIT, MAP_SEARCH_STRATIFIED_PER_CELL, buildMapSearchPlan, classifyIntentFit,
+    MAP_SEARCH_DEFAULT_LIMIT, MAP_SEARCH_MAX_LIMIT, NEIGHBOR_CONTEXT_LIMIT, NEIGHBOR_SEED_CAP,
+    MAP_SEARCH_RECALL_PASS_LIMIT, MAP_SEARCH_STRATIFIED_PER_CELL, SIMILAR_REVIEWS_DEFAULT_LIMIT, SIMILAR_REVIEWS_MAX_LIMIT,
+    buildMapSearchPlan, classifyIntentFit,
     evaluateCoverageWarning, fuseRanks, gridIndex, lexicalScore, likePattern, neighborEligible,
     normalizedColumnSql, prepareTopicSql, selectDiversifiedRows, selectSpreadIslands, validateTopicSql
 } from './mapSearch';
@@ -62,6 +63,7 @@ export class ToolExecutor {
                 case 'sql_query': return await this.sqlQuery(toolCall.id, args);
                 case 'map_search': return await this.mapSearch(toolCall.id, args);
                 case 'flexible_search': return await this.flexibleSearch(toolCall.id, args);
+                case 'similar_reviews': return await this.similarReviews(toolCall.id, args);
                 default: return { name, call_id: toolCall.id, result: null, error: `Unknown tool: ${name}` };
             }
         } catch (error) {
@@ -101,14 +103,14 @@ export class ToolExecutor {
             } };
         }
         const plan = buildMapSearchPlan(String(args.query || ''), args.terms || []);
-        const direct = retrieval.rows.filter(row => row.match_type !== 'cluster_neighbor');
+        const direct = retrieval.rows.filter(row => row.match_type !== 'embedding_neighbor');
         const eligibleNeighbors = retrieval.expanded_rows.filter(row => neighborEligible(String(row.description || ''), plan));
         const reserve = Math.min(ANALYZER_NEIGHBOR_RESERVE_CAP, Math.ceil(ANALYZER_MAX_ROWS * ANALYZER_PROJECTION_CONTEXT_SHARE));
         const neighborCount = Math.min(reserve, eligibleNeighbors.length);
         const chosen = [...direct.slice(0, ANALYZER_MAX_ROWS - neighborCount), ...eligibleNeighbors.slice(0, neighborCount)];
         const analyzerRows = chosen.map(row => ({
             id: row.id, points: row.points, price: row.price, country: row.country, variety: row.variety, title: row.title,
-            evidence_type: row.match_type === 'cluster_neighbor' ? 'projection_neighbor_context' : plan.directPhrases.length ? 'direct_lexical_match' : 'scope_sample',
+            evidence_type: row.match_type === 'embedding_neighbor' ? 'embedding_neighbor_context' : plan.directPhrases.length ? 'direct_lexical_match' : 'scope_sample',
             text: String(row.description || '').slice(0, 3500)
         }));
         const analysis = await this.analyze(args.prompt || args.query || 'Topic sample', analyzerRows, region);
@@ -144,13 +146,14 @@ export class ToolExecutor {
         } else {
             rows = diversify(await this.ranked(plan, region, Math.max(limit, 180), matchMode), limit, bounds);
         }
-        const expanded_rows = args.expand_clusters ? await this.expand(rows, region) : [];
+        const expansion = args.expand_clusters ? await this.expand(rows, region) : { rows: [] as ReviewRow[], warnings: [] as string[] };
+        const expanded_rows = expansion.rows;
         const seed_islands = hasTerms ? await this.islands(plan, bounds, region, args.match_mode === 'AND' ? 'AND' : 'OR') : [];
         const diagnostics = await this.coverage(bounds, region, hasTerms ? plan : null, rows, matchMode);
         const matchRows = await this.countMatches(plan, region, hasTerms, matchMode);
         const scopeRows = await this.query(`SELECT COUNT(*) AS scope_count FROM reviews WHERE ${scopeSql(region)}`);
         return {
-            method, warnings: plan.warnings, recall_passes, rows, expanded_rows, seed_islands, ...diagnostics,
+            method, warnings: [...plan.warnings, ...expansion.warnings], recall_passes, rows, expanded_rows, seed_islands, ...diagnostics,
             scope_count: Number(scopeRows[0]?.scope_count || 0), sample_count: rows.length,
             lexical_match_count: matchRows, region: region || null,
             region_contract: {
@@ -247,23 +250,87 @@ export class ToolExecutor {
         }));
     }
 
-    private async expand(seeds: ReviewRow[], region?: Region): Promise<ReviewRow[]> {
-        const anchors = seeds.filter(row => Number.isFinite(row.projection_x)).slice(0, 12);
-        if (!anchors.length) return [];
-        const radius = Math.min(MAP_SEARCH_PROJECTION_RADIUS, MAP_SEARCH_PROJECTION_RADIUS_CAP);
-        const ids = [...new Set(seeds.map(row => row.id))].join(',');
-        const near = anchors.map(row => `(projection_x - ${row.projection_x}) * (projection_x - ${row.projection_x}) + (projection_y - ${row.projection_y}) * (projection_y - ${row.projection_y}) <= ${radius * radius}`).join(' OR ');
-        const distanceSql = `LEAST(${anchors.map(row => `(projection_x - ${row.projection_x}) * (projection_x - ${row.projection_x}) + (projection_y - ${row.projection_y}) * (projection_y - ${row.projection_y})`).join(',')})`;
+    private async similarReviews(callId: string, args: any): Promise<ToolResult> {
+        const seedIds = [...new Set<number>((Array.isArray(args.seed_ids) ? args.seed_ids : []).map(Number))]
+            .filter(id => Number.isSafeInteger(id) && id >= 0).slice(0, NEIGHBOR_SEED_CAP);
+        if (!seedIds.length) return { name: 'similar_reviews', call_id: callId, result: null, error: 'Name up to 12 seed reviews.' };
+        const limit = Math.floor(Math.min(SIMILAR_REVIEWS_MAX_LIMIT, Math.max(1, finite(args.limit, SIMILAR_REVIEWS_DEFAULT_LIMIT))));
+        const hop = await this.neighborHop(seedIds, args.region as Region | undefined, limit);
+        return { name: 'similar_reviews', call_id: callId, result: {
+            method: 'embedding_neighbors_v1', hop: 1, seeds: hop.seeds, rows: hop.rows, warnings: hop.warnings, row_count: hop.rows.length
+        } };
+    }
+
+    private async expand(seeds: ReviewRow[], region?: Region): Promise<{ rows: ReviewRow[]; warnings: string[] }> {
+        const anchors = [...new Set(seeds.map(row => row.id).filter(id => Number.isSafeInteger(id)))].slice(0, NEIGHBOR_SEED_CAP);
+        if (!anchors.length) return { rows: [], warnings: [] };
+        const hop = await this.neighborHop(anchors, region, NEIGHBOR_CONTEXT_LIMIT);
+        const direct = new Set(seeds.map(row => row.id));
+        return { rows: hop.rows.filter(row => !direct.has(row.id)), warnings: hop.warnings };
+    }
+
+    private async neighborHop(seedIds: number[], region: Region | undefined, limit: number): Promise<{ seeds: number[]; rows: ReviewRow[]; warnings: string[] }> {
+        const idList = seedIds.join(',');
+        let classified: any[];
+        try {
+            classified = await this.query(`
+                WITH requested AS (SELECT UNNEST([${idList}]::INTEGER[]) AS seed_id)
+                SELECT requested.seed_id AS seed_id,
+                       (reviews.__row_index__ IS NOT NULL) AS in_scope,
+                       (reviews.neighbors IS NOT NULL
+                         AND reviews.neighbors.ids IS NOT NULL
+                         AND reviews.neighbors.distances IS NOT NULL
+                         AND len(reviews.neighbors.ids) = len(reviews.neighbors.distances)
+                         AND len(reviews.neighbors.ids) > 0) AS usable
+                FROM requested
+                LEFT JOIN reviews ON reviews.__row_index__ = requested.seed_id
+            `);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (/neighbors/i.test(message)) throw new Error('neighbors column is missing');
+            throw error;
+        }
+        const warnings: string[] = [];
+        const usable: number[] = [];
+        const seen = new Set<number>();
+        for (const row of classified) {
+            const id = Number(row.seed_id);
+            seen.add(id);
+            if (!row.in_scope) warnings.push(`Seed ${id} is outside the current scope.`);
+            else if (!row.usable) warnings.push(`Seed ${id} has no usable neighbor list.`);
+            else usable.push(id);
+        }
+        for (const id of seedIds) if (!seen.has(id)) warnings.push(`Seed ${id} is outside the current scope.`);
+        if (!usable.length) return { seeds: [], rows: [], warnings };
         const rows = await this.query(`
-            SELECT ${COLUMNS}, ${distanceSql} AS projection_distance FROM reviews
-            WHERE ${scopeSql(region)} AND __row_index__ NOT IN (${ids || 'NULL'}) AND (${near})
-            ORDER BY projection_distance ASC, __row_index__ ASC
-            LIMIT 25
+            WITH hop AS (
+                SELECT seed.__row_index__ AS seed_id,
+                       seed.neighbors.ids[idx] AS neighbor_id,
+                       seed.neighbors.distances[idx] AS cosine_distance,
+                       idx AS ord
+                FROM reviews AS seed
+                CROSS JOIN LATERAL range(1, len(seed.neighbors.ids) + 1) AS r(idx)
+                WHERE seed.__row_index__ IN (${usable.join(',')})
+            ),
+            ranked AS (
+                SELECT neighbor_id, seed_id, cosine_distance,
+                       ROW_NUMBER() OVER (PARTITION BY neighbor_id ORDER BY cosine_distance ASC, seed_id ASC) AS rn
+                FROM hop
+                WHERE ord > 1 AND neighbor_id <> seed_id AND cosine_distance > 1e-6
+                  AND neighbor_id NOT IN (${seedIds.join(',')})
+            )
+            SELECT ranked.seed_id, ranked.cosine_distance, ${COLUMNS.split(', ').map(column => `reviews.${column}`).join(', ')}
+            FROM ranked
+            JOIN reviews ON reviews.__row_index__ = ranked.neighbor_id
+            WHERE ranked.rn = 1 AND ${scopeSql(region, 'reviews')}
+            ORDER BY ranked.cosine_distance ASC, ranked.neighbor_id ASC
+            LIMIT ${limit}
         `);
-        return rows.map(row => {
-            const distance = Math.min(...anchors.map(seed => Math.hypot(Number(row.projection_x) - seed.projection_x, Number(row.projection_y) - seed.projection_y)));
-            return { ...toReview(row, 'cluster_neighbor'), distance };
-        }).sort((a, b) => a.distance - b.distance).slice(0, 25);
+        return {
+            seeds: usable,
+            warnings,
+            rows: rows.map(row => ({ ...toReview(row, 'embedding_neighbor'), seed_id: Number(row.seed_id), cosine_distance: Number(row.cosine_distance) }))
+        };
     }
 
     private async coverage(bounds: Bounds, region: Region | undefined, plan: SearchPlan | null, rows: ReviewRow[], mode: 'AND' | 'OR') {
@@ -337,8 +404,8 @@ export class ToolExecutor {
 
 interface ReviewRow {
     id: number; description: string; title: string; points: number; price: number; variety: string; country: string;
-    projection_x: number; projection_y: number; lexical_score: number; match_type: 'direct' | 'cluster_neighbor';
-    distance?: number; recall_passes?: string[];
+    projection_x: number; projection_y: number; lexical_score: number; match_type: 'direct' | 'embedding_neighbor';
+    seed_id?: number; cosine_distance?: number; recall_passes?: string[];
 }
 
 function toReview(row: any, matchType: ReviewRow['match_type']): ReviewRow {
@@ -371,9 +438,10 @@ function ranges(bounds: Bounds) {
     return { rangeX: Math.max(bounds.max_x - bounds.min_x, 1e-9), rangeY: Math.max(bounds.max_y - bounds.min_y, 1e-9) };
 }
 
-function scopeSql(region?: Region): string {
+function scopeSql(region?: Region, alias?: string): string {
     if (!region) return 'TRUE';
-    return `projection_x BETWEEN ${region.min_x} AND ${region.max_x} AND projection_y BETWEEN ${region.min_y} AND ${region.max_y}`;
+    const column = (name: string) => alias ? `${alias}.${name}` : name;
+    return `${column('projection_x')} BETWEEN ${region.min_x} AND ${region.max_x} AND ${column('projection_y')} BETWEEN ${region.min_y} AND ${region.max_y}`;
 }
 
 function like(term: string): string {

@@ -22,6 +22,14 @@ connection.query(`CREATE TABLE reviews AS SELECT * FROM (VALUES
     (4, 'apple pear', 'D', 90, 22, 'Chardonnay', 'USA', 8.0, 8.0),
     (5, 'pepper beef outside', 'E', 95, 40, 'Syrah', 'USA', 0.99, 0.99)
 ) AS t(__row_index__, description, title, points, price, variety, country, projection_x, projection_y)`);
+connection.query(`ALTER TABLE reviews ADD COLUMN neighbors STRUCT(ids INTEGER[], distances DOUBLE[])`);
+connection.query(`UPDATE reviews SET neighbors = CASE __row_index__
+    WHEN 1 THEN {'ids': [1, 2, 5, 4], 'distances': [0.0, 0.20, 0.03, 0.40]}::STRUCT(ids INTEGER[], distances DOUBLE[])
+    WHEN 2 THEN {'ids': [2, 1, 3], 'distances': [0.0, 0.02, 0.04]}::STRUCT(ids INTEGER[], distances DOUBLE[])
+    WHEN 3 THEN {'ids': [3, 2], 'distances': [0.0, 0.04]}::STRUCT(ids INTEGER[], distances DOUBLE[])
+    WHEN 5 THEN {'ids': [5, 2, 1], 'distances': [0.0, 0.05, 0.03]}::STRUCT(ids INTEGER[], distances DOUBLE[])
+    ELSE NULL
+END`);
 const base = { async query(sql: string) { return connection.query(sql); } };
 const bounds = { min_x: 0, max_x: 10, min_y: 0, max_y: 10 };
 const ring = { min_x: 1, max_x: 2, min_y: 1, max_y: 2 };
@@ -78,9 +86,10 @@ test('AND mode has consistent retrieval and count semantics', async () => {
 test('UI highlights exclude neighbor context and failed calls', () => {
     assert.deepEqual(extractHighlightIds([
         { name: 'flexible_search', call_id: 'a', result: { rows: [{ id: 1 }, { id: 99 }], evidence_ids: [1] } },
-        { name: 'map_search', call_id: 'b', result: { rows: [{ id: 2, match_type: 'direct' }, { id: 98, match_type: 'cluster_neighbor' }] } },
+        { name: 'map_search', call_id: 'b', result: { rows: [{ id: 2, match_type: 'direct' }, { id: 98, match_type: 'embedding_neighbor' }] } },
+        { name: 'similar_reviews', call_id: 'd', result: { rows: [{ id: 5, match_type: 'embedding_neighbor' }] } },
         { name: 'sql_query', call_id: 'c', error: 'failed', result: { rows: [{ id: 97 }] } }
-    ]), [1, 2]);
+    ]), [1, 2, 5]);
 });
 
 test('workspace execution intersects the request selection', async () => {
@@ -115,4 +124,43 @@ test('Agents SDK completes exact analytics with real tools and no Analyzer', asy
         globalThis.fetch = originalFetch;
         if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = originalKey;
     }
+});
+
+test('embedding neighbors are one hop, scoped, and are not a ring', async () => {
+    const sql: string[] = [];
+    const traced = { async query(statement: string) { sql.push(statement); return base.query(statement); } };
+    const executor = new ToolExecutor(traced);
+    const one = await executor.execute({ id: 'one', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1], reason: 'like the first' }) } });
+    assert.equal(one.error, undefined);
+    assert.deepEqual(one.result.rows.map((row: { id: number }) => row.id), [5, 2, 4]);
+    assert.equal(one.result.rows.some((row: { id: number }) => row.id === 1 || row.id === 3), false);
+    assert.equal(one.result.candidate_rings, undefined);
+    const both = await executor.execute({ id: 'both', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1, 5], reason: 'closer seed' }) } });
+    const shared = both.result.rows.find((row: { id: number }) => row.id === 2);
+    assert.equal(shared.seed_id, 5); assert.equal(shared.cosine_distance, 0.05);
+    const malformed = await executor.execute({ id: 'bad-seed', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1, 4], reason: 'missing list' }) } });
+    assert.match(malformed.result.warnings.join(' '), /Seed 4/);
+    assert.ok(malformed.result.rows.some((row: { id: number }) => row.id === 5));
+    const scoped = new ToolExecutor(scopeCoordinator(base, [1, 2, 3]).coordinator);
+    const inside = await scoped.execute({ id: 'scoped', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1], reason: 'selection' }) } });
+    assert.deepEqual(inside.result.rows.map((row: { id: number }) => row.id), [2]);
+    assert.equal(Number((await base.query('SELECT COUNT(*) AS n FROM reviews')).toArray()[0].n), 5);
+    const originalFetch = globalThis.fetch;
+    let analyzerIds: number[] = [];
+    globalThis.fetch = async (_input, init) => {
+        analyzerIds = JSON.parse(String(init?.body)).reviews.map((row: { id: number }) => row.id);
+        return new Response(JSON.stringify({ category: 'Pepper Syrah', themes: ['pepper'], summary: 'Pepper.', intent_fit: 0.9, coherence: 'coherent', representative_evidence_ids: [1, 4, 5] }), { status: 200 });
+    };
+    try {
+        const judged = await executor.execute({ id: 'judge-neighbors', type: 'function', function: { name: 'flexible_search', arguments: JSON.stringify({ prompt: 'pepper', query: 'pepper', region: ring, reason: 'judge' }) } });
+        assert.equal(analyzerIds.includes(4) || analyzerIds.includes(5), false);
+        assert.equal((judged.result.evidence_ids as number[]).includes(4), false);
+        assert.equal((judged.result.evidence_ids as number[]).includes(5), false);
+    } finally { globalThis.fetch = originalFetch; }
+    const outside = await executor.execute({ id: 'outside-ring', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1], reason: 'no ring' }) } });
+    assert.ok(outside.result.rows.some((row: { id: number }) => row.id === 5));
+    assert.equal(sql.some(statement => statement.includes('0.045')), false);
+    const missing = { async query(statement: string) { if (/neighbors/i.test(statement)) throw new Error('Referenced column "neighbors" not found'); return base.query(statement); } };
+    const failed = await new ToolExecutor(missing).execute({ id: 'missing', type: 'function', function: { name: 'similar_reviews', arguments: JSON.stringify({ seed_ids: [1], reason: 'no column' }) } });
+    assert.match(failed.error || '', /neighbors column is missing/);
 });
