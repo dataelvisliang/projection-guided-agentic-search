@@ -18,7 +18,7 @@ interface Probe {
     status: 'candidate' | 'judged' | 'refined' | 'discarded';
 }
 const NARROW = new Set<PlaybookId>(['exact_analytics', 'row_examples']);
-const SEARCH = new Set<ActionName>(['sql_query', 'map_search', 'flexible_search']);
+const SEARCH = new Set<ActionName>(['sql_query', 'map_search', 'flexible_search', 'similar_reviews']);
 
 /** The model chooses navigation. This session validates evidence and termination. */
 export class SearchSession {
@@ -33,6 +33,7 @@ export class SearchSession {
     private actions = 0;
     private tokens = 0;
     private sqlThisTurn = 0;
+    private similarThisTurn = 0;
     private refinements = 0;
     private nonImproving = 0;
     private dimensionSql = 0;
@@ -54,6 +55,7 @@ export class SearchSession {
     private busy = false;
     private sequence = 0;
     private scopeKey = 'full-map';
+    private selectionIds: number[] | undefined;
     private prior: SearchContext['probed_regions'] = [];
     private priorSameQuery = false;
     private coveredCells = new Set<string>();
@@ -72,6 +74,7 @@ export class SearchSession {
 
     setContext(context: SearchContext | undefined, scopeKey: string): void {
         this.scopeKey = scopeKey;
+        this.selectionIds = context?.selection_ids === undefined ? undefined : [...new Set(context.selection_ids)].sort((a, b) => a - b);
         if (context?.scope_key === scopeKey) {
             this.prior = context.probed_regions;
             this.priorSameQuery = context.query === this.query;
@@ -82,6 +85,7 @@ export class SearchSession {
         if (requests === this.requestGeneration) return;
         this.requestGeneration = requests;
         this.sqlThisTurn = 0;
+        this.similarThisTurn = 0;
     }
     end(state: Terminal['state'], reason: string): void {
         if (this.terminal) return;
@@ -153,6 +157,10 @@ export class SearchSession {
             return this.deny(name, 'A viable ring exists. Next use region-constrained flexible_search or transition_ring.');
         if (name === 'sql_query' && !narrow && this.sqlThisTurn >= this.limits.sqlPerTurnBeforeJudge && !this.judgments.length)
             return this.deny(name, 'At most two SQL queries in one assistant turn before the first flexible_search.');
+        if (name === 'similar_reviews' && this.awaitingJudge)
+            return this.deny(name, 'A viable ring exists. Next use region-constrained flexible_search or transition_ring.');
+        if (name === 'similar_reviews' && this.similarThisTurn >= this.limits.similarPerTurn)
+            return this.deny(name, 'At most two similar-review lookups in one assistant turn.');
         const successfulSearch = this.results.some(r => !r.error && (r.name === 'map_search' || r.name === 'flexible_search') && (r.result?.lexical_match_count > 0 || r.result?.sample_count > 0 || r.result?.rows?.length));
         if (name === 'sql_query') {
             if ((this.playbook === 'semantic_count' || this.playbook === 'facet_use_case_discovery') && !successfulSearch)
@@ -166,30 +174,37 @@ export class SearchSession {
                 if (!explicitLiteral && !proxy) return this.deny(name, 'SQL text matching is only for an explicit literal count or an established, labeled literal/proxy condition.');
             }
         }
-        const shape = searchShape(name, data);
-        if (this.shapes.has(shape)) return this.deny(name, 'Repeating a search shape is forbidden; changing only the explanation is not a new search.');
         const region = data.region as Region | undefined;
         let workspaceIds: number[] | undefined;
         if (data.workspace_set_id) {
             const source = this.results.find(r => !r.error && r.result?.result_set_id === data.workspace_set_id);
             if (!source) return this.deny(name, 'workspace_set_id must name a successful result from this turn.');
-            const ids: number[] = source.name === 'flexible_search' ? source.result.evidence_ids || [] : (source.result.rows || []).filter((r: { match_type?: string }) => r.match_type !== 'cluster_neighbor').map((r: { id?: number; __row_index__?: number }) => r.id ?? r.__row_index__);
-            workspaceIds = [...new Set(ids.filter(Number.isSafeInteger))];
+            workspaceIds = directIds(source);
             if (!workspaceIds.length) return this.deny(name, 'This result set contains no row ids to scope a query.');
         }
+        let seedIds: number[] | undefined;
+        if (name === 'similar_reviews') {
+            const resolved = this.resolveSeeds(data, workspaceIds);
+            if (resolved.error) return this.deny(name, resolved.error);
+            seedIds = resolved.seedIds;
+            data = { ...data, seed_ids: seedIds };
+        }
+        const shape = searchShape(name, data);
+        if (this.shapes.has(shape)) return this.deny(name, 'Repeating a search shape is forbidden; changing only the explanation is not a new search.');
         if (name === 'flexible_search' && this.awaitingJudge && !region)
             return this.deny(name, 'Judging a ring requires its exact region.');
-        if (name !== 'sql_query' && !region && !String(data.query || '') && !(data.terms as string[])?.length)
+        if (name !== 'sql_query' && name !== 'similar_reviews' && !region && !String(data.query || '') && !(data.terms as string[])?.length)
             return this.deny(name, 'Search needs terms or a region.');
-        if (region && this.priorSameQuery && this.prior.some(p => sameRegion(p.region, region) && (p.status === 'discarded' || (p.intent_fit !== null && (p.intent_fit >= 0.8 || p.intent_fit < 0.55)))))
+        if (name !== 'similar_reviews' && region && this.priorSameQuery && this.prior.some(p => sameRegion(p.region, region) && (p.status === 'discarded' || (p.intent_fit !== null && (p.intent_fit >= 0.8 || p.intent_fit < 0.55)))))
             return this.deny(name, 'This ring was already accepted or rejected for the same question. Explore a neighbor or change its bounds.');
-        const refining = !narrow && this.judgments.some(j => j.eligible) && !this.awaitingJudge;
+        const refining = name !== 'similar_reviews' && !narrow && this.judgments.some(j => j.eligible) && !this.awaitingJudge;
         if (refining && this.refinements >= this.limits.refinements)
             return this.deny(name, 'Three refinement attempts have been used. Call complete_answer.');
         this.shapes.add(shape);
         if (refining) this.refinements++;
         if (name === 'sql_query') { this.sqlThisTurn++; this.dimensionSql++; }
         if (name === 'flexible_search') this.dimensionFlexible++;
+        if (name === 'similar_reviews') this.similarThisTurn++;
         this.busy = true;
         let executed: ToolResult;
         try {
@@ -260,6 +275,8 @@ export class SearchSession {
         if (/\{\{[^{}]*\}\}/.test(data.explanation)) return this.deny('complete_answer', 'Category cards are rendered from categories; do not insert card tokens in explanation.');
         const sets = data.result_set_ids.map(id => this.results.find(r => !r.error && r.result?.result_set_id === id));
         if (sets.some(s => !s)) return this.deny('complete_answer', 'Use only successful result_set_ids returned this turn.');
+        if (sets.some(s => s!.name === 'similar_reviews') && (data.evidence_kind !== 'row_examples' || !data.bounded || this.playbook !== 'row_examples'))
+            return this.deny('complete_answer', 'Similar reviews can be cited only as bounded row examples.');
         const structured = data.evidence_kind === 'exact_sql' || data.evidence_kind === 'literal_proxy' || data.evidence_kind === 'row_examples';
         if (structured) {
             if (!sets.length || data.categories.length) return this.deny('complete_answer', 'Structured evidence needs result_set_ids and no topic categories.');
@@ -296,6 +313,19 @@ export class SearchSession {
     private deny(tool: string, reason: string): unknown {
         this.event(tool, 'blocked', undefined, reason);
         return { error: reason, session: this.modelState() };
+    }
+    private resolveSeeds(data: Record<string, unknown>, workspaceIds?: number[]): { error?: string; seedIds?: number[] } {
+        const requested = [...new Set(((data.seed_ids as number[]) || []).filter(id => Number.isSafeInteger(id)))].sort((a, b) => a - b);
+        if (requested.length) {
+            if (this.selectionIds && requested.some(id => !this.selectionIds!.includes(id)))
+                return { error: 'Seed reviews must belong to the current selection.' };
+            if (workspaceIds && requested.some(id => !workspaceIds.includes(id)))
+                return { error: 'Seed reviews must belong to the workspace result.' };
+            return { seedIds: requested.slice(0, 12) };
+        }
+        if (workspaceIds?.length) return { seedIds: [...workspaceIds].sort((a, b) => a - b).slice(0, 12) };
+        if (this.selectionIds && this.selectionIds.length >= 1 && this.selectionIds.length <= 12) return { seedIds: this.selectionIds };
+        return { error: 'Name up to 12 seed reviews. A full map or a selection larger than 12 has no default seeds.' };
     }
     context(): SearchContext {
         const current = this.probes.map(p => {
@@ -343,8 +373,19 @@ export class SearchSession {
 function regionKey(region: Region): string { return [region.min_x, region.max_x, region.min_y, region.max_y].map(v => v.toFixed(6)).join(','); }
 function searchShape(name: string, data: Record<string, unknown>): string {
     if (name === 'sql_query') return `sql:${String(data.sql).replace(/\s+/g, ' ').trim()}:${data.workspace_set_id || '-'}`;
+    if (name === 'similar_reviews') {
+        const seeds = [...new Set((data.seed_ids as number[]) || [])].sort((a, b) => a - b).join(',');
+        return `similar:${seeds}:${data.region ? regionKey(data.region as Region) : '-'}:${data.limit || 25}`;
+    }
     const terms = [String(data.query || ''), ...((data.terms as string[]) || [])].map(normalizeSearchText).filter(Boolean).sort();
     return `${name}:${data.region ? regionKey(data.region as Region) : '-'}:${[...new Set(terms)].join('|')}:${data.match_mode || 'OR'}:${data.workspace_set_id || '-'}`;
+}
+function directIds(source: ToolResult): number[] {
+    const rows = source.result?.rows || [];
+    const ids: number[] = source.name === 'flexible_search' ? source.result.evidence_ids || []
+        : source.name === 'similar_reviews' ? rows.map((row: { id?: number }) => row.id)
+        : rows.filter((row: { match_type?: string }) => row.match_type !== 'embedding_neighbor' && row.match_type !== 'cluster_neighbor').map((row: { id?: number; __row_index__?: number }) => row.id ?? row.__row_index__);
+    return [...new Set(ids.filter(id => Number.isSafeInteger(id)))];
 }
 function sameRegion(a: Region, b: Region): boolean { return regionKey(a) === regionKey(b); }
 export type SearchPolicySnapshot = ReturnType<SearchSession['snapshot']>;

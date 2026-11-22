@@ -245,7 +245,8 @@ function App() {
   const getToolIcon = (toolName: string) => {
     switch (toolName) {
       case 'map_search':
-      case 'flexible_search': return <Search size={12} />;
+      case 'flexible_search':
+      case 'similar_reviews': return <Search size={12} />;
       case 'sql_query':
       case 'load_workflow_playbook': return <Database size={12} />;
       case 'compare_regions': return <BarChart3 size={12} />;
@@ -259,6 +260,7 @@ function App() {
     sql_query: 'Checking the data',
     map_search: 'Finding examples',
     flexible_search: 'Reviewing evidence',
+    similar_reviews: 'Finding similar reviews',
     transition_ring: 'Adjusting the search',
     complete_answer: 'Preparing the answer',
     save_selection: 'Saving examples'

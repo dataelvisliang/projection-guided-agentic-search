@@ -40,7 +40,8 @@ export function extractHighlightIds(toolResults: ToolResult[]): number[] {
         const values = result.name === 'flexible_search'
             ? result.result?.evidence_ids || []
             : result.name === 'save_selection' ? result.result?.record_ids || []
-            : (result.result?.rows || []).filter((row: { match_type?: string }) => row.match_type !== 'cluster_neighbor').map((row: { id?: number; __row_index__?: number }) => row.id ?? row.__row_index__);
+            : result.name === 'similar_reviews' ? (result.result?.rows || []).map((row: { id?: number }) => row.id)
+            : (result.result?.rows || []).filter((row: { match_type?: string }) => row.match_type !== 'embedding_neighbor' && row.match_type !== 'cluster_neighbor').map((row: { id?: number; __row_index__?: number }) => row.id ?? row.__row_index__);
         for (const id of values) if (Number.isSafeInteger(id)) ids.add(id);
     }
     return [...ids];

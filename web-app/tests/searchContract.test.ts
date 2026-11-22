@@ -18,6 +18,7 @@ class Fixture {
     async execute(call: ToolCall): Promise<ToolResult> {
         this.calls.push(call);
         const args = JSON.parse(call.function.arguments);
+        if (call.function.name === 'similar_reviews') return { name: call.function.name, call_id: call.id, result: { method: 'embedding_neighbors_v1', hop: 1, rows: [{ id: 3, match_type: 'embedding_neighbor', description: 'quiet bottle' }] } };
         return { name: call.function.name, call_id: call.id, result: call.function.name === 'sql_query'
             ? { rows: [{ n: 8 }], candidate_rings: this.rings }
             : { category: 'Pepper Syrah', themes: ['pepper'], summary: 'Pepper appears in these reviews.',
@@ -174,6 +175,45 @@ test('isolated relevant rows can survive rejection of the surrounding ring', asy
 test('explanation cannot inject unvalidated category cards', async () => {
     const s = new SearchSession('pepper', bounds), f = new Fixture(); await load(s, f); await judge(s, f);
     assert.match(error(await finish(s, f, { explanation: '{{Invented Category}}' })), /card tokens/);
+});
+test('similar reviews stay examples and cannot preempt a waiting ring', async () => {
+    const waiting = new SearchSession('pepper', bounds), pending = new Fixture();
+    await load(waiting, pending); pending.rings = [{ ...ring, support: 4 }]; await sql(waiting, pending);
+    assert.match(error(await waiting.act('similar_reviews', { seed_ids: [1], reason: 'similar bottles' }, pending)), /region-constrained/);
+    const full = new SearchSession('similar wines', bounds), open = new Fixture();
+    await load(full, open, 'row_examples');
+    assert.match(error(await full.act('similar_reviews', { reason: 'similar bottles' }, open)), /12 seed/);
+    const broad = new SearchSession('similar wines', bounds), many = new Fixture();
+    broad.setContext({ selection_ids: Array.from({ length: 13 }, (_, index) => index), probed_regions: [] }, 'broad');
+    await load(broad, many, 'row_examples');
+    assert.match(error(await broad.act('similar_reviews', { reason: 'similar bottles' }, many)), /12 seed/);
+    const s = new SearchSession('similar wines', bounds), f = new Fixture();
+    s.setContext({ selection_ids: [1, 2], probed_regions: [] }, 'pair');
+    await load(s, f, 'row_examples');
+    await s.act('similar_reviews', { reason: 'similar bottles' }, f);
+    assert.deepEqual(JSON.parse(f.calls.at(-1)!.function.arguments).seed_ids, [1, 2]);
+    assert.equal(s.snapshot().refinements_used, 0);
+    assert.match(error(await finish(s, f, { categories: ['Pepper Syrah'], evidence_kind: 'accepted_rings', result_set_ids: ['set-1'], bounded: true })), /bounded row examples/);
+    assert.match(error(await finish(s, f, { categories: [], evidence_kind: 'row_examples', result_set_ids: ['set-1'], bounded: false })), /bounded row examples/);
+    await finish(s, f, { categories: [], evidence_kind: 'row_examples', result_set_ids: ['set-1'], bounded: true });
+    assert.equal(s.terminal?.state, 'partial_success');
+    const repeat = new SearchSession('similar wines', bounds), twice = new Fixture();
+    await load(repeat, twice, 'row_examples');
+    await repeat.act('similar_reviews', { seed_ids: [4], reason: 'first' }, twice);
+    await repeat.act('similar_reviews', { seed_ids: [5], reason: 'second' }, twice);
+    assert.match(error(await repeat.act('similar_reviews', { seed_ids: [6], reason: 'third' }, twice)), /two similar/);
+    repeat.observeModelRequest(1);
+    assert.equal(error(await repeat.act('similar_reviews', { seed_ids: [6], reason: 'next turn' }, twice)), '');
+});
+test('a similar lookup does not establish semantic-count terms or spend a refinement', async () => {
+    const s = new SearchSession('how many peppery wines', bounds), f = new Fixture();
+    await load(s, f, 'semantic_count');
+    await s.act('similar_reviews', { seed_ids: [1], reason: 'nearby wording' }, f);
+    assert.match(error(await sql(s, f)), /forbids SQL/);
+    await judge(s, f);
+    const before = s.snapshot().refinements_used;
+    await s.act('similar_reviews', { seed_ids: [2], reason: 'another set' }, f);
+    assert.equal(s.snapshot().refinements_used, before);
 });
 test('new relevant evidence resets consecutive non-improving judgments', async () => {
     const s = new SearchSession('pepper', bounds), f = new Fixture(); await load(s, f); await judge(s, f);

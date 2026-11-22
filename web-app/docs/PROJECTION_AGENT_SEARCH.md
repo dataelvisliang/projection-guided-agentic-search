@@ -1,6 +1,6 @@
 # Topic Ring Probe
 
-Version: `topic-ring-probe-v2`. The search unit is a bounded rectangular ring, not a circle or an individual keyword hit. Projection geometry generates hypotheses; review text establishes evidence.
+Version: `topic-ring-probe-v3`. The search unit is a bounded rectangular ring, not a circle or an individual keyword hit. Projection geometry generates hypotheses; review text establishes evidence. One-hop embedding neighbors answer similarity only.
 
 ## Dataset adaptation
 
@@ -22,7 +22,8 @@ Tool execution is serialized so each state transition is validated against the p
 - A topic category is eligible only with a bounded region, nonempty directly relevant evidence IDs, positive sample/support counts, non-low fit, non-fallback analysis, and known coherent or mixed content.
 - Analyzer `coherence` is a separate content judgment (`coherent`, `mixed`, `low`), not a geometric inference. High fit is >= 0.8; medium is >= 0.55. Medium or mixed evidence requires `bounded: true`.
 - Regionless results, fallback summaries and low-fit rings cannot support topic conclusions. Directly judged rows in a rejected ring can still support bounded isolated examples, never a cluster claim.
-- Projection neighbors stay inside the requested region and immutable request scope. Only phrase matches or two-token matches reach the Analyzer, with up to 13 of its 50 slots reserved for context. Neighbor IDs never become direct evidence or map highlights.
+- Judge context reads the stored embedding `neighbors` lists, one hop, inside the ring and the immutable request scope. Only phrase matches or two-token matches reach the Analyzer, with up to 13 of its 50 slots reserved for context. Those ids never become direct evidence or map highlights.
+- `similar_reviews` returns one-hop neighbors of at most 12 named seeds, a workspace result, or a selection of 1–12 ids. It creates no ring. Cite it only as bounded `row_examples`. A full map, or a selection larger than 12, needs named seeds.
 - Representative evidence IDs are intersected with the actual direct Analyzer input. Separate accepted categories produce separate saved cards; duplicate Analyzer names are disambiguated.
 - Coverage is computed from the final Analyzer sample. No-term sampling uses the scope's occupied cells rather than treating its match coverage as zero. Warnings cannot be overridden by high fit. Expanded returned-cell coverage can clear the warning after reaching the reference 10% threshold; this is retrieval coverage, not semantic prevalence.
 - Answers flag samples below 100 reviews as potentially unrepresentative. A bounded answer is `partial_success`, including one containing high-fit rings.

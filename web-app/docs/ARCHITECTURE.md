@@ -12,7 +12,7 @@ flowchart TD
   Presenter --> UI
 ```
 
-The main Agent chooses a playbook, rectangular rings, refinements and completion requests. SearchSession owns current-turn evidence, transitions, budgets and terminal state. The SDK runs the tool loop. XY is a candidate space; text establishes semantic evidence. No embedding service or vector index is introduced.
+The main Agent chooses a playbook, rectangular rings, refinements and completion requests. SearchSession owns current-turn evidence, transitions, budgets and terminal state. The SDK runs the tool loop. XY is a candidate space; text establishes semantic evidence. Similarity reads the precomputed `neighbors` column, one hop. No embedding service or vector index is introduced.
 
 See [the versioned search contract](PROJECTION_AGENT_SEARCH.md) for schemas, state transitions, termination and evaluation conditions. Old `SearchPolicy` and `ProjectionController` implementations were removed. Tool schemas and instructions derive from `src/agent/searchContract.ts`.
 
